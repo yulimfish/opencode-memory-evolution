@@ -1,6 +1,10 @@
 # Never publish personal memory data or local Dream output.
 *.db
 *.db-*
+*.sqlite
+*.sqlite3
+*.dump
+*.sql
 backups/
 dream/*.md
 !dream/TEMPLATE.md

@@ -40,13 +40,13 @@ permission:
 
 ### Phase 0 · 门控（Gate）
 
-1. 取锁：`dreamctl lock acquire --ttl 7200 --trigger scheduled`
+1. 取锁：`lock_output=$(dreamctl lock acquire --ttl 7200 --trigger scheduled)`，记下输出中的 `token=...`。
    - 输出 `LOCKED ...`（退出码 3）→ 说明另一个 Dream 正在跑。**立即结束**，首行 `DREAM SKIPPED (locked)`，不要做任何其他事。
    - 输出 `ACQUIRED ...` → 继续。记住：**结束时必须 release**。
 2. `dreamctl stats` → 读取 `gate.pass`：
-   - `false` → `dreamctl log "skip: <gate.reasons 拼接>"`，然后 `dreamctl lock release`，首行 `DREAM SKIPPED (gate)`，结束。
+   - `false` → `dreamctl log "skip: <gate.reasons 拼接>"`，然后 `dreamctl lock release --token <token>`，首行 `DREAM SKIPPED (gate)`，结束。
    - `true` → 继续。
-3. 后续任何阶段失败，也要尽力先 `dreamctl lock release` 再报 `BLOCKED:`。
+3. 后续任何阶段失败，也要尽力先 `dreamctl lock release --token <token>` 再报 `BLOCKED:`。
 
 ### Phase 1 · Orient（定向）
 
@@ -93,7 +93,7 @@ permission:
 ### Phase 6 · 产出与收尾
 
 1. 读 `~/.config/opencode/memory/dream/TEMPLATE.md`，按其中结构写报告到 `~/.config/opencode/memory/dream/<stats.now 的日期>-dream.md`（重名则加后缀）。写完用 read 抽查关键段落确认内容完整。
-2. **释放锁**：`dreamctl lock release`。
+2. **释放锁**：`dreamctl lock release --token <token>`。
 3. 最终消息（≤10 行）：首行 `DREAM DONE`；然后报告路径、信号计数、提案计数（各类）、异常。不要复述报告全文。
 
 ## 参考

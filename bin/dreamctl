@@ -3,14 +3,14 @@
 # automated Dream pipeline (P0: report-only, never writes to the memory DB).
 #
 # The ONLY files it writes live inside the dream staging dir:
-#   - .run.lock   (concurrency lock)
+#   - .run.lock/ (atomic concurrency lock directory)
 #   - run.log     (one-line run/skip log)
 #
 # Usage:
 #   dreamctl stats
 #   dreamctl prompts --since <iso|epoch> [--limit N] [--project P] [--max-chars N]
 #   dreamctl memories --since <iso|epoch> [--limit N] [--project P]
-#   dreamctl lock acquire [--ttl SECONDS] [--trigger NAME] | release | status
+#   dreamctl lock acquire [--ttl SECONDS] [--trigger NAME] | release --token TOKEN | status
 #   dreamctl log <message>
 #
 # Env overrides (gate defaults):
@@ -269,26 +269,51 @@ cmd_lock() {
           *) die "lock acquire: unknown arg $1" ;;
         esac
       done
-      if [ -f "$LOCK_FILE" ]; then
-        local age stored_ttl
+      local token="$(date +%s).$$.$RANDOM" age stored_ttl stale_dir owner
+      while :; do
+        if mkdir "$LOCK_FILE" 2>/dev/null; then
+          printf '%s pid:%s %s trigger:%s ttl:%s token:%s\n' "$(ms_to_iso "$((now_s * 1000))")" "$$" "$(hostname -s)" "$trigger" "$ttl" "$token" > "$LOCK_FILE/owner"
+          printf 'ACQUIRED ttl=%ss trigger=%s token=%s\n' "$ttl" "$trigger" "$token"
+          break
+        fi
+        now_s=$(date +%s)
         age=$(( now_s - $(stat -f %m "$LOCK_FILE") ))
-        stored_ttl=$(grep -o 'ttl:[0-9]*' "$LOCK_FILE" 2>/dev/null | head -1 | cut -d: -f2 || true)
+        owner=$(head -c 200 "$LOCK_FILE/owner" 2>/dev/null || true)
+        stored_ttl=$(printf '%s' "$owner" | grep -o 'ttl:[0-9]*' | head -1 | cut -d: -f2 || true)
         stored_ttl="${stored_ttl:-7200}"
         if [ "$age" -lt "$stored_ttl" ]; then
-          printf 'LOCKED age=%ss ttl=%ss owner=%s\n' "$age" "$stored_ttl" "$(head -c 200 "$LOCK_FILE")"
+          printf 'LOCKED age=%ss ttl=%ss owner=%s\n' "$age" "$stored_ttl" "$owner"
           exit 3
         fi
         printf 'WARN: stale lock age=%ss >= ttl=%ss, overriding\n' "$age" "$stored_ttl" >&2
-      fi
-      printf '%s pid:%s %s trigger:%s ttl:%s\n' "$(ms_to_iso "$((now_s * 1000))")" "$$" "$(hostname -s)" "$trigger" "$ttl" > "$LOCK_FILE"
-      printf 'ACQUIRED ttl=%ss trigger=%s\n' "$ttl" "$trigger"
+        stale_dir="${LOCK_FILE}.stale.$$"
+        mv "$LOCK_FILE" "$stale_dir" 2>/dev/null || continue
+        rm -rf "$stale_dir"
+      done
       ;;
     release)
-      if [ -f "$LOCK_FILE" ]; then rm -f "$LOCK_FILE"; printf 'RELEASED\n'; else printf 'NO_LOCK\n'; fi
+      local token=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --token) token="$2"; shift 2 ;;
+          *) die "lock release: unknown arg $1" ;;
+        esac
+      done
+      [ -n "$token" ] || die "lock release requires --token from lock acquire"
+      if [ -d "$LOCK_FILE" ]; then
+        local owner
+        owner=$(cat "$LOCK_FILE/owner" 2>/dev/null || true)
+        case "$owner" in
+          *" token:$token") rm -rf "$LOCK_FILE"; printf 'RELEASED\n' ;;
+          *) die "lock release token does not own the active lock" ;;
+        esac
+      else
+        printf 'NO_LOCK\n'
+      fi
       ;;
     status)
-      if [ -f "$LOCK_FILE" ]; then
-        printf '{"locked":true,"age_seconds":%s,"owner":%s}\n' "$(( now_s - $(stat -f %m "$LOCK_FILE") ))" "$(jq -Rn --arg o "$(head -c 200 "$LOCK_FILE")" '$o')"
+      if [ -d "$LOCK_FILE" ]; then
+        printf '{"locked":true,"age_seconds":%s,"owner":%s}\n' "$(( now_s - $(stat -f %m "$LOCK_FILE") ))" "$(jq -Rn --arg o "$(head -c 200 "$LOCK_FILE/owner" 2>/dev/null || true)" '$o')"
       else
         printf '{"locked":false,"age_seconds":null,"owner":null}\n'
       fi

@@ -1,10 +1,10 @@
 # opencode-mem P1 补丁清单（v2.19.4）
 
 - 日期：2026-09-12
-- 基版本：opencode-mem 2.19.4（`~/.config/opencode/node_modules/opencode-mem/dist`，npm 安装，非 fork）
+- 基版本：opencode-mem 2.19.4（`node_modules/opencode-mem/dist`，npm 安装，非 fork）
 - 目的：自进化记忆系统 v2 · P1 —— 暂存状态 / 证据链字段 / 软失效 / 合并端点 / outcome 打标 / 三处已知缺陷修复
 - 补丁文件：`p1.patch`（17 文件，+360/−81 行，`patch -p1` 于 `node_modules/opencode-mem/` 下应用；其中 11 个 JS 运行时文件 + 6 个同名 `.d.ts` 类型声明同步）
-- 数据备份（改 schema 前）：`~/.opencode-mem/backups/2026-09-12-213719/`（18 库 / 45MB）
+- 数据备份（改 schema 前）：本地备份（18 库 / 45MB）
 - 回滚：重装 `opencode-mem@2.19.4` 恢复代码；数据为增量加列 + 软失效，无破坏性改动，必要时用上述备份还原（注意：若已有软失效行，回滚旧代码会让失效行重新可见——当前 0 行，回滚干净）
 
 ## 改动清单
@@ -41,7 +41,7 @@
 ## 验证记录（2026-09-12）
 
 - 17 个改动文件 Node 动态 import / 类型自洽全过（语法/加载）。
-- 功能测试 `29/29 PASS`（写入真实 AIWorkspace 分片，测完硬删清零）：惰性迁移加列 + 索引、常规/暂存写入、搜索/列表/会话检索三路排除暂存、合并软失效、原条检索排除、staged 合并不动原条、update 保留标志与置顶、isStaged 审批覆写、端点处理器、WebUI 可见性、**linked 回填跳过失效行**、**merge 响应透传 staged**、死配置清除；测试见 `/var/folders/.../T/opencode/p1-test/test-p1.mjs`。
+- 功能测试 `29/29 PASS`（写入真实 AIWorkspace 分片，测完硬删清零）：惰性迁移加列 + 索引、常规/暂存写入、搜索/列表/会话检索三路排除暂存、合并软失效、原条检索排除、staged 合并不动原条、update 保留标志与置顶、isStaged 审批覆写、端点处理器、WebUI 可见性、**linked 回填跳过失效行**、**merge 响应透传 staged**、死配置清除；测试脚本为本地临时文件。
 - 补丁在 pristine 树（before/）上 `patch -p1` 应用成功，17 文件产物与实盘逐字节一致。
 - 回归集：**在补丁代码上直跑**（in-process `handleSearch`，与 /api/search 同代码路径）R@5 = 39/46（84.8%），与 P0 基线逐题一致（同 7 个 miss）；另经 HTTP（长驻旧代码 server）复跑同为 39/46。无劣化。
 - 第一轮独立审计（上轮记录里的 CONDITIONAL PASS 三项 MAJOR）已修：linked-memory 回填过滤、per-session 捕获锁、回归证据改直连补丁代码。
