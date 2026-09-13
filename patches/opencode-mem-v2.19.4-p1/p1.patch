@@ -1,0 +1,970 @@
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -48,7 +48,10 @@
+     logAutoCaptureProviderStatus();
+     const tags = getTags(directory);
+     let webServer = null;
+-    let idleTimeout = null;
++    // P1 fix: per-session debounce timers. Previously a single shared variable
++    // meant two sessions going idle within 10s clobbered each other, dropping
++    // one capture entirely.
++    const idleTimeouts = new Map();
+     if (!isConfigured()) {
+     }
+     const GLOBAL_PLUGIN_WARMUP_KEY = Symbol.for("opencode-mem.plugin.warmedup");
+@@ -157,10 +160,10 @@
+         });
+     }
+     const cleanupPlugin = async () => {
+-        if (idleTimeout) {
+-            clearTimeout(idleTimeout);
+-            idleTimeout = null;
++        for (const timer of idleTimeouts.values()) {
++            clearTimeout(timer);
+         }
++        idleTimeouts.clear();
+         if (webServer)
+             await webServer.stop();
+         if (memoryClient)
+@@ -462,9 +465,24 @@
+                 const sessionID = event.properties?.sessionID;
+                 if (!sessionID)
+                     return;
+-                if (idleTimeout)
+-                    clearTimeout(idleTimeout);
+-                idleTimeout = setTimeout(async () => {
++                // P1 fix: subagent (task tool child) sessions must not trigger
++                // project-memory capture — their transcript is already covered by
++                // the parent session, and capturing it created duplicate noise.
++                try {
++                    const sessionInfo = await ctx.client.session.get({ path: { id: sessionID } });
++                    if (sessionInfo?.data?.parentID) {
++                        log("Auto-capture skipped for subagent session", { sessionID });
++                        return;
++                    }
++                }
++                catch (error) {
++                    log("session.get failed; proceeding with capture", { sessionID, error: String(error) });
++                }
++                const existingTimer = idleTimeouts.get(sessionID);
++                if (existingTimer)
++                    clearTimeout(existingTimer);
++                const timer = setTimeout(async () => {
++                    idleTimeouts.delete(sessionID);
+                     try {
+                         await performAutoCapture(ctx, sessionID, directory);
+                         if (webServer?.isServerOwner()) {
+@@ -479,10 +497,8 @@
+                     catch (error) {
+                         log("Idle processing error", { error: String(error) });
+                     }
+-                    finally {
+-                        idleTimeout = null;
+-                    }
+                 }, 10000);
++                idleTimeouts.set(sessionID, timer);
+             }
+             if (event.type === "session.compacted") {
+                 if (!isConfigured() || !CONFIG.compaction.enabled)
+--- a/dist/config.js
++++ b/dist/config.js
+@@ -22,7 +22,6 @@
+     embeddingDimensions: 768,
+     similarityThreshold: 0.6,
+     maxMemories: 10,
+-    maxProfileItems: 5,
+     injectProfile: true,
+     containerTagPrefix: "opencode",
+     autoCaptureEnabled: true,
+@@ -40,10 +39,6 @@
+     deduplicationEnabled: true,
+     deduplicationSimilarityThreshold: 0.9,
+     userProfileAnalysisInterval: 10,
+-    userProfileDisplayPreferences: 20,
+-    userProfileDisplayPatterns: 15,
+-    userProfileDisplayWorkflows: 10,
+-    userProfileStaleDays: 2,
+     userProfileInjectPreferences: 5,
+     userProfileInjectPatterns: 5,
+     userProfileInjectWorkflows: 3,
+@@ -307,18 +302,6 @@
+   // - Skill level (overall and per-domain assessment)
+   "userProfileAnalysisInterval": 10,
+ 
+-  // Days before inactive items (all types) are eligible for removal
+-  "userProfileStaleDays": 2,
+-
+-  // Number of preferences shown in UI
+-  "userProfileDisplayPreferences": 20,
+-  
+-  // Number of patterns shown in UI
+-  "userProfileDisplayPatterns": 15,
+-  
+-  // Number of workflows shown in UI
+-  "userProfileDisplayWorkflows": 10,
+-  
+   // Number of preferences injected into LLM conversation context
+   // Keep this small — the strongest signals are enough; more dilute LLM attention
+   "userProfileInjectPreferences": 5,
+@@ -428,7 +411,6 @@
+             : undefined,
+         similarityThreshold: fileConfig.similarityThreshold ?? DEFAULTS.similarityThreshold,
+         maxMemories: fileConfig.maxMemories ?? DEFAULTS.maxMemories,
+-        maxProfileItems: fileConfig.maxProfileItems ?? DEFAULTS.maxProfileItems,
+         injectProfile: fileConfig.injectProfile ?? DEFAULTS.injectProfile,
+         containerTagPrefix: fileConfig.containerTagPrefix ?? DEFAULTS.containerTagPrefix,
+         autoCaptureEnabled: fileConfig.autoCaptureEnabled ?? DEFAULTS.autoCaptureEnabled,
+@@ -462,9 +444,6 @@
+         deduplicationEnabled: fileConfig.deduplicationEnabled ?? DEFAULTS.deduplicationEnabled,
+         deduplicationSimilarityThreshold: fileConfig.deduplicationSimilarityThreshold ?? DEFAULTS.deduplicationSimilarityThreshold,
+         userProfileAnalysisInterval: fileConfig.userProfileAnalysisInterval ?? DEFAULTS.userProfileAnalysisInterval,
+-        userProfileDisplayPreferences: fileConfig.userProfileDisplayPreferences ?? DEFAULTS.userProfileDisplayPreferences,
+-        userProfileDisplayPatterns: fileConfig.userProfileDisplayPatterns ?? DEFAULTS.userProfileDisplayPatterns,
+-        userProfileDisplayWorkflows: fileConfig.userProfileDisplayWorkflows ?? DEFAULTS.userProfileDisplayWorkflows,
+         userProfileInjectPreferences: fileConfig.userProfileInjectPreferences ?? DEFAULTS.userProfileInjectPreferences,
+         userProfileInjectPatterns: fileConfig.userProfileInjectPatterns ?? DEFAULTS.userProfileInjectPatterns,
+         userProfileInjectWorkflows: fileConfig.userProfileInjectWorkflows ?? DEFAULTS.userProfileInjectWorkflows,
+@@ -483,7 +462,6 @@
+             DEFAULTS.userProfileEmbeddingMinDescriptionLength,
+         userProfileMinEvidenceForRetention: fileConfig.userProfileMinEvidenceForRetention ?? DEFAULTS.userProfileMinEvidenceForRetention,
+         userProfileValidationEnabled: fileConfig.userProfileValidationEnabled ?? DEFAULTS.userProfileValidationEnabled,
+-        userProfileStaleDays: fileConfig.userProfileStaleDays ?? DEFAULTS.userProfileStaleDays,
+         showAutoCaptureToasts: fileConfig.showAutoCaptureToasts ?? DEFAULTS.showAutoCaptureToasts,
+         showUserProfileToasts: fileConfig.showUserProfileToasts ?? DEFAULTS.showUserProfileToasts,
+         showErrorToasts: fileConfig.showErrorToasts ?? DEFAULTS.showErrorToasts,
+--- a/dist/config.d.ts
++++ b/dist/config.d.ts
+@@ -12,7 +12,6 @@
+     embeddingApiKey?: string;
+     similarityThreshold?: number;
+     maxMemories?: number;
+-    maxProfileItems?: number;
+     injectProfile?: boolean;
+     containerTagPrefix?: string;
+     autoCaptureEnabled?: boolean;
+@@ -39,10 +38,6 @@
+     deduplicationEnabled?: boolean;
+     deduplicationSimilarityThreshold?: number;
+     userProfileAnalysisInterval?: number;
+-    userProfileDisplayPreferences?: number;
+-    userProfileDisplayPatterns?: number;
+-    userProfileDisplayWorkflows?: number;
+-    userProfileStaleDays?: number;
+     userProfileInjectPreferences?: number;
+     userProfileInjectPatterns?: number;
+     userProfileInjectWorkflows?: number;
+@@ -81,7 +76,6 @@
+     embeddingApiKey: string | undefined;
+     similarityThreshold: number;
+     maxMemories: number;
+-    maxProfileItems: number;
+     injectProfile: boolean;
+     containerTagPrefix: string;
+     autoCaptureEnabled: boolean;
+@@ -109,9 +103,6 @@
+     deduplicationEnabled: boolean;
+     deduplicationSimilarityThreshold: number;
+     userProfileAnalysisInterval: number;
+-    userProfileDisplayPreferences: number;
+-    userProfileDisplayPatterns: number;
+-    userProfileDisplayWorkflows: number;
+     userProfileInjectPreferences: number;
+     userProfileInjectPatterns: number;
+     userProfileInjectWorkflows: number;
+@@ -125,7 +116,6 @@
+     userProfileEmbeddingMinDescriptionLength: number;
+     userProfileMinEvidenceForRetention: number;
+     userProfileValidationEnabled: boolean;
+-    userProfileStaleDays: number;
+     showAutoCaptureToasts: boolean;
+     showUserProfileToasts: boolean;
+     showErrorToasts: boolean;
+@@ -154,7 +144,6 @@
+     embeddingApiKey: string | undefined;
+     similarityThreshold: number;
+     maxMemories: number;
+-    maxProfileItems: number;
+     injectProfile: boolean;
+     containerTagPrefix: string;
+     autoCaptureEnabled: boolean;
+@@ -182,9 +171,6 @@
+     deduplicationEnabled: boolean;
+     deduplicationSimilarityThreshold: number;
+     userProfileAnalysisInterval: number;
+-    userProfileDisplayPreferences: number;
+-    userProfileDisplayPatterns: number;
+-    userProfileDisplayWorkflows: number;
+     userProfileInjectPreferences: number;
+     userProfileInjectPatterns: number;
+     userProfileInjectWorkflows: number;
+@@ -198,7 +184,6 @@
+     userProfileEmbeddingMinDescriptionLength: number;
+     userProfileMinEvidenceForRetention: number;
+     userProfileValidationEnabled: boolean;
+-    userProfileStaleDays: number;
+     showAutoCaptureToasts: boolean;
+     showUserProfileToasts: boolean;
+     showErrorToasts: boolean;
+--- a/dist/services/auto-capture.js
++++ b/dist/services/auto-capture.js
+@@ -6,11 +6,14 @@
+ import { loadOpencodeProvider } from "./ai/opencode-provider-loader.js";
+ const MAX_TOOL_INPUT_LENGTH = 100;
+ const RETRY_BASE_DELAY_MS = 2000;
+-let isCaptureRunning = false;
++// P1 fix: per-session single-flight. The old module-level boolean let one long
++// capture block another session's capture entirely (dropped prompt until that
++// session's next idle — permanent if the session never idles again).
++const captureLocks = new Set();
+ export async function performAutoCapture(ctx, sessionID, directory) {
+-    if (isCaptureRunning)
++    if (captureLocks.has(sessionID))
+         return;
+-    isCaptureRunning = true;
++    captureLocks.add(sessionID);
+     try {
+         const prompts = userPromptManager.getUncapturedPromptsForSession(sessionID);
+         if (prompts.length === 0) {
+@@ -25,7 +28,7 @@
+         }
+     }
+     finally {
+-        isCaptureRunning = false;
++        captureLocks.delete(sessionID);
+     }
+ }
+ async function capturePrompt(ctx, sessionID, directory, prompt, maxRetries) {
+@@ -91,6 +94,7 @@
+                     sessionID,
+                     promptId: prompt.id,
+                     captureTimestamp: Date.now(),
++                    outcome: summaryResult.outcome,
+                     displayName: tags.project.displayName,
+                     userName: tags.project.userName,
+                     userEmail: tags.project.userEmail,
+@@ -311,7 +315,8 @@
+ 3. NO meta-commentary or behavior analysis
+ 4. Include specific file names, functions, technical details
+ 5. Generate 2-4 technical tags (e.g., "react", "auth", "bug-fix")
+-6. You MUST write the summary in ${langName}.
++6. Set outcome: "corrected" if the user corrected or rejected the AI's approach in this exchange, "rework" if the work needed fixes after a failed attempt, "success" if it completed cleanly, "none" if unclear
++7. You MUST write the summary in ${langName}.
+ 
+ FORMAT:
+ ## Request
+@@ -324,12 +329,13 @@
+ CAPTURE if: code changed, bug fixed, feature added, decision made`;
+             const aiPrompt = `${context}
+ 
+-Analyze this conversation. If it contains technical work (code, bugs, features, decisions), create a concise summary and relevant tags. If it's non-technical (greetings, casual chat, incomplete requests), return type="skip" with empty summary.`;
++Analyze this conversation. If it contains technical work (code, bugs, features, decisions), create a concise summary, relevant tags, and an outcome label. If it's non-technical (greetings, casual chat, incomplete requests), return type="skip" with empty summary.`;
+             const { z } = await import("zod");
+             const schema = z.object({
+                 summary: z.string(),
+                 type: z.string(),
+                 tags: z.array(z.string()),
++                outcome: z.string().optional(),
+             });
+             const result = await generateStructuredOutput({
+                 client: v2Client,
+@@ -343,6 +349,7 @@
+                 summary: result.summary,
+                 type: result.type,
+                 tags: (result.tags || []).map((t) => t.toLowerCase().trim()),
++                outcome: normalizeOutcome(result.outcome),
+             };
+         }
+         catch (e) {
+@@ -372,7 +379,8 @@
+ 3. NO meta-commentary or behavior analysis
+ 4. Include specific file names, functions, technical details
+ 5. Generate 2-4 technical tags (e.g., "react", "auth", "bug-fix")
+-6. You MUST write the summary in ${langName}.
++6. Set outcome: "corrected" if the user corrected or rejected the AI's approach in this exchange, "rework" if the work needed fixes after a failed attempt, "success" if it completed cleanly, "none" if unclear
++7. You MUST write the summary in ${langName}.
+ 
+ FORMAT:
+ ## Request
+@@ -385,7 +393,7 @@
+ CAPTURE if: code changed, bug fixed, feature added, decision made`;
+     const aiPrompt = `${context}
+ 
+-Analyze this conversation. If it contains technical work (code, bugs, features, decisions), create a concise summary and relevant tags. If it's non-technical (greetings, casual chat, incomplete requests), return type="skip" with empty summary.`;
++Analyze this conversation. If it contains technical work (code, bugs, features, decisions), create a concise summary, relevant tags, and an outcome label. If it's non-technical (greetings, casual chat, incomplete requests), return type="skip" with empty summary.`;
+     const toolSchema = {
+         type: "function",
+         function: {
+@@ -407,6 +415,10 @@
+                         items: { type: "string" },
+                         description: "List of 2-4 technical tags related to the memory",
+                     },
++                    outcome: {
++                        type: "string",
++                        description: "Outcome label: success | rework | corrected | none",
++                    },
+                 },
+                 required: ["summary", "type", "tags"],
+             },
+@@ -420,5 +432,11 @@
+         summary: result.data.summary,
+         type: result.data.type,
+         tags: (result.data.tags || []).map((t) => t.toLowerCase().trim()),
++        outcome: normalizeOutcome(result.data.outcome),
+     };
+ }
++const OUTCOME_LABELS = new Set(["success", "rework", "corrected", "none"]);
++function normalizeOutcome(value) {
++    const v = typeof value === "string" ? value.toLowerCase().trim() : "";
++    return OUTCOME_LABELS.has(v) ? v : undefined;
++}
+--- a/dist/services/client.js
++++ b/dist/services/client.js
+@@ -123,7 +123,11 @@
+             const shard = shardManager.getWriteShard(scope, hash);
+             const id = `mem_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
+             const now = Date.now();
+-            const { displayName, userName, userEmail, projectPath, projectName, gitRepoUrl, type, tags: _tags, ...dynamicMetadata } = metadata || {};
++            const { displayName, userName, userEmail, projectPath, projectName, gitRepoUrl, type, tags: _tags, isStaged, source, authority, observedAt, validUntil, ...dynamicMetadata } = metadata || {};
++            // Keep source in metadata JSON as well (backwards compatibility with
++            // readers that predate the dedicated column).
++            if (source)
++                dynamicMetadata.source = source;
+             const record = {
+                 id,
+                 content,
+@@ -141,6 +145,11 @@
+                 projectName,
+                 gitRepoUrl,
+                 metadata: Object.keys(dynamicMetadata).length > 0 ? JSON.stringify(dynamicMetadata) : undefined,
++                isStaged: isStaged ? 1 : 0,
++                source,
++                authority,
++                observedAt,
++                validUntil,
+             };
+             const db = connectionManager.getConnection(shard.dbPath);
+             // Use transaction for atomic SQLite insert
+@@ -148,10 +157,11 @@
+                 const insertStmt = db.prepare(`
+           INSERT INTO memories (
+             id, content, vector, tags_vector, container_tag, tags, type, created_at, updated_at,
+-            metadata, display_name, user_name, user_email, project_path, project_name, git_repo_url
+-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++            metadata, display_name, user_name, user_email, project_path, project_name, git_repo_url,
++            is_staged, source, authority, observed_at, valid_until
++          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         `);
+-                insertStmt.run(record.id, record.content, toBlob(record.vector), toBlob(record.tagsVector), record.containerTag, record.tags || null, record.type || null, record.createdAt, record.updatedAt, record.metadata || null, record.displayName || null, record.userName || null, record.userEmail || null, record.projectPath || null, record.projectName || null, record.gitRepoUrl || null);
++                insertStmt.run(record.id, record.content, toBlob(record.vector), toBlob(record.tagsVector), record.containerTag, record.tags || null, record.type || null, record.createdAt, record.updatedAt, record.metadata || null, record.displayName || null, record.userName || null, record.userEmail || null, record.projectPath || null, record.projectName || null, record.gitRepoUrl || null, record.isStaged ? 1 : 0, record.source || null, record.authority || null, record.observedAt || null, record.validUntil || null);
+             });
+             insertMemory();
+             // Vector index update (outside transaction — vector backend is async/in-memory)
+@@ -229,6 +239,11 @@
+                 projectPath: r.project_path,
+                 projectName: r.project_name,
+                 gitRepoUrl: r.git_repo_url,
++                isStaged: r.is_staged === 1,
++                source: r.source ?? undefined,
++                authority: r.authority ?? undefined,
++                observedAt: r.observed_at ?? undefined,
++                validUntil: r.valid_until ?? undefined,
+             }));
+             return {
+                 success: true,
+@@ -283,7 +298,90 @@
+             const errorMessage = error instanceof Error ? error.message : String(error);
+             log("searchMemoriesBySessionID: error", { error: errorMessage });
+             return { success: false, error: errorMessage, results: [], total: 0, timing: 0 };
++        }
++    }
++    /**
++     * P1 merge: create one consolidated memory from N originals, then
++     * SOFT-invalidate the originals (valid_until set — history preserved,
++     * retrieval excludes them). Never physically deletes.
++     */
++    async mergeMemories(ids, content, options = {}) {
++        try {
++            await this.initialize();
++            if (!Array.isArray(ids) || ids.length === 0) {
++                return { success: false, error: "ids[] is required" };
++            }
++            if (!content || !content.trim()) {
++                return { success: false, error: "content is required" };
++            }
++            const allShards = [...shardManager.getAllShards("user", ""), ...shardManager.getAllShards("project", "")];
++            const found = [];
++            for (const shard of allShards) {
++                const db = connectionManager.getConnection(shard.dbPath);
++                for (const id of ids) {
++                    const row = vectorSearch.getMemoryById(db, id);
++                    if (row) {
++                        found.push({ id, row, shard });
++                    }
++                }
++            }
++            if (found.length === 0) {
++                return { success: false, error: "No memories found for given ids" };
++            }
++            const anchor = found[0].row;
++            const tagSet = new Set();
++            for (const f of found) {
++                const raw = f.row.tags ? f.row.tags.split(",") : [];
++                for (const t of raw) {
++                    const v = t.trim();
++                    if (v)
++                        tagSet.add(v);
++                }
++            }
++            const tags = options.tags && options.tags.length > 0
++                ? options.tags.map((t) => String(t).trim().toLowerCase()).filter(Boolean)
++                : Array.from(tagSet);
++            const addResult = await this.addMemory(content.trim(), anchor.container_tag, {
++                type: options.type || anchor.type,
++                tags,
++                source: options.source || "merge",
++                authority: options.authority,
++                isStaged: options.isStaged,
++                mergedFrom: found.map((f) => f.id),
++                mergedAt: Date.now(),
++                displayName: anchor.display_name,
++                userName: anchor.user_name,
++                userEmail: anchor.user_email,
++                projectPath: anchor.project_path,
++                projectName: anchor.project_name,
++                gitRepoUrl: anchor.git_repo_url,
++            });
++            if (!addResult.success) {
++                return addResult;
++            }
++            // A staged merge is a PROPOSAL: originals stay live until a human
++            // approves it (approval tooling must use mergedFrom metadata to
++            // invalidate then). Only a direct merge invalidates immediately.
++            if (options.isStaged) {
++                return { success: true, id: addResult.id, merged: found.length, invalidated: 0, staged: true };
++            }
++            const now = Date.now();
++            let invalidated = 0;
++            for (const f of found) {
++                const db = connectionManager.getConnection(f.shard.dbPath);
++                const res = db
++                    .prepare(`UPDATE memories SET valid_until = ?, updated_at = ? WHERE id = ? AND COALESCE(valid_until, 0) = 0`)
++                    .run(now, now, f.id);
++                if (Number(res.changes) > 0)
++                    invalidated++;
++            }
++            return { success: true, id: addResult.id, merged: found.length, invalidated };
+         }
++        catch (error) {
++            const errorMessage = error instanceof Error ? error.message : String(error);
++            log("mergeMemories: error", { error: errorMessage });
++            return { success: false, error: errorMessage };
++        }
+     }
+ }
+ export const memoryClient = new LocalMemoryClient();
+--- a/dist/services/client.d.ts
++++ b/dist/services/client.d.ts
+@@ -28,7 +28,7 @@
+     }>;
+     addMemory(content: string, containerTag: string, metadata?: {
+         type?: MemoryType;
+-        source?: "manual" | "auto-capture" | "import" | "api";
++        source?: "manual" | "auto-capture" | "import" | "api" | "merge" | string;
+         tags?: string[];
+         tool?: string;
+         sessionID?: string;
+@@ -40,6 +40,10 @@
+         projectPath?: string;
+         projectName?: string;
+         gitRepoUrl?: string;
++        isStaged?: boolean;
++        authority?: string;
++        observedAt?: number;
++        validUntil?: number;
+         [key: string]: unknown;
+     }): Promise<{
+         success: true;
+@@ -70,6 +74,11 @@
+             projectPath: any;
+             projectName: any;
+             gitRepoUrl: any;
++            isStaged: boolean;
++            source: any;
++            authority: any;
++            observedAt: any;
++            validUntil: any;
+         }[];
+         pagination: {
+             currentPage: number;
+@@ -114,6 +123,23 @@
+         total: number;
+         timing: number;
+     }>;
++    mergeMemories(ids: string[], content: string, options?: {
++        tags?: string[];
++        type?: string;
++        authority?: string;
++        isStaged?: boolean;
++        source?: string;
++    }): Promise<{
++        success: true;
++        id: string;
++        merged: number;
++        invalidated: number;
++        staged?: boolean;
++        error?: undefined;
++    } | {
++        success: false;
++        error: string;
++    }>;
+ }
+ export declare const memoryClient: LocalMemoryClient;
+ //# sourceMappingURL=client.d.ts.map
+\ No newline at end of file
+--- a/dist/services/api-handlers.js
++++ b/dist/services/api-handlers.js
+@@ -104,7 +104,9 @@
+             const shards = shardManager.getAllShards(tagScope, hash);
+             for (const shard of shards) {
+                 const db = connectionManager.getConnection(shard.dbPath);
+-                const memories = vectorSearch.listMemories(db, tag, 10000);
++                // Review surface: staged/invalidated rows stay visible here (with
++                // flags) so humans can approve or inspect them in the WebUI.
++                const memories = vectorSearch.listMemories(db, tag, 10000, { includeNonRetrievable: true });
+                 allMemories.push(...memories);
+             }
+         }
+@@ -144,6 +146,11 @@
+                 projectName: r.project_name,
+                 gitRepoUrl: r.git_repo_url,
+                 isPinned: r.is_pinned === 1,
++                isStaged: Number(r.is_staged ?? 0) === 1,
++                source: r.source ?? metadata?.source,
++                authority: r.authority ?? undefined,
++                observedAt: r.observed_at ?? undefined,
++                validUntil: r.valid_until ?? undefined,
+             };
+         });
+         let timeline = memoriesWithType;
+@@ -218,6 +225,11 @@
+                     projectName: item.projectName,
+                     gitRepoUrl: item.gitRepoUrl,
+                     isPinned: item.isPinned,
++                    isStaged: item.isStaged,
++                    source: item.source,
++                    authority: item.authority,
++                    observedAt: item.observedAt,
++                    validUntil: item.validUntil,
+                 };
+             }
+             else {
+@@ -359,8 +371,9 @@
+         if (!id)
+             return { success: false, error: "id is required" };
+         await embeddingService.warmup();
+-        // Find the existing memory first (read-only — no data modified yet)
+-        const projectShards = shardManager.getAllShards("project", "");
++        // Find the existing memory first (read-only — no data modified yet).
++        // Scan both user- and project-scoped shards (merge can anchor on either).
++        const projectShards = [...shardManager.getAllShards("user", ""), ...shardManager.getAllShards("project", "")];
+         let foundShard = null, existingMemory = null;
+         for (const shard of projectShards) {
+             const db = connectionManager.getConnection(shard.dbPath);
+@@ -391,10 +404,11 @@
+             const insertStmt = db.prepare(`
+         INSERT INTO memories (
+           id, content, vector, tags_vector, container_tag, tags, type, created_at, updated_at,
+-          metadata, display_name, user_name, user_email, project_path, project_name, git_repo_url
+-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++          metadata, display_name, user_name, user_email, project_path, project_name, git_repo_url,
++          is_staged, source, authority, observed_at, valid_until, is_pinned
++        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       `);
+-            insertStmt.run(id, newContent, toBlob(vector), toBlob(tagsVector), existingMemory.container_tag, tags.length > 0 ? tags.join(",") : null, data.type || existingMemory.type, existingMemory.created_at, Date.now(), existingMemory.metadata, existingMemory.display_name, existingMemory.user_name, existingMemory.user_email, existingMemory.project_path, existingMemory.project_name, existingMemory.git_repo_url);
++            insertStmt.run(id, newContent, toBlob(vector), toBlob(tagsVector), existingMemory.container_tag, tags.length > 0 ? tags.join(",") : null, data.type || existingMemory.type, existingMemory.created_at, Date.now(), existingMemory.metadata, existingMemory.display_name, existingMemory.user_name, existingMemory.user_email, existingMemory.project_path, existingMemory.project_name, existingMemory.git_repo_url, data.isStaged !== undefined ? (data.isStaged ? 1 : 0) : (existingMemory.is_staged ?? 0), existingMemory.source ?? null, existingMemory.authority ?? null, existingMemory.observed_at ?? null, existingMemory.valid_until ?? null, existingMemory.is_pinned ?? 0);
+         });
+         // Execute the SQLite transaction atomically
+         updateTransaction();
+@@ -413,6 +427,36 @@
+         return { success: false, error: String(error) };
+     }
+ }
++export async function handleMergeMemories(data) {
++    try {
++        const ids = Array.isArray(data?.ids) ? data.ids.filter((v) => typeof v === "string" && v.length > 0) : [];
++        if (ids.length === 0) {
++            return { success: false, error: "ids[] is required" };
++        }
++        if (!data?.content || !String(data.content).trim()) {
++            return { success: false, error: "content is required" };
++        }
++        const { memoryClient } = await import("./client.js");
++        const result = await memoryClient.mergeMemories(ids, String(data.content), {
++            tags: Array.isArray(data.tags) ? data.tags : undefined,
++            type: data.type,
++            authority: data.authority,
++            isStaged: data.isStaged,
++            source: data.source,
++        });
++        if (!result.success) {
++            return { success: false, error: result.error };
++        }
++        return {
++            success: true,
++            data: { id: result.id, merged: result.merged, invalidated: result.invalidated, staged: result.staged === true },
++        };
++    }
++    catch (error) {
++        log("handleMergeMemories: error", { error: String(error) });
++        return { success: false, error: String(error) };
++    }
++}
+ export async function handleSearch(query, tag, page = 1, pageSize = 20) {
+     try {
+         if (!query)
+@@ -530,7 +574,10 @@
+                 const db = connectionManager.getConnection(shard.dbPath);
+                 for (const mid of missingMemoryIds) {
+                     const m = vectorSearch.getMemoryById(db, mid);
+-                    if (m && !paginatedResults.some((existing) => existing.id === m.id)) {
++                    // P1: linked-memory backfill is still a retrieval path — skip
++                    // staged/invalidated rows so soft-invalidated originals cannot
++                    // resurface through a prompt's linked id.
++                    if (m && !Number(m.is_staged) && !Number(m.valid_until) && !paginatedResults.some((existing) => existing.id === m.id)) {
+                         paginatedResults.push({
+                             type: "memory",
+                             id: m.id,
+--- a/dist/services/api-handlers.d.ts
++++ b/dist/services/api-handlers.d.ts
+@@ -65,7 +65,22 @@
+     content?: string;
+     type?: MemoryType;
+     tags?: string[];
++    isStaged?: boolean;
+ }): Promise<ApiResponse<void>>;
++export declare function handleMergeMemories(data: {
++    ids?: string[];
++    content?: string;
++    tags?: string[];
++    type?: string;
++    authority?: string;
++    isStaged?: boolean;
++    source?: string;
++}): Promise<ApiResponse<{
++    id: string;
++    merged: number;
++    invalidated: number;
++    staged?: boolean;
++}>>;
+ interface FormattedPrompt {
+     type: "prompt";
+     id: string;
+--- a/dist/services/sqlite/shard-manager.js
++++ b/dist/services/sqlite/shard-manager.js
+@@ -10,6 +10,7 @@
+ export class ShardManager {
+     metadataDb;
+     metadataPath;
++    migratedShardPaths = new Set();
+     constructor() {
+         this.metadataPath = join(CONFIG.storagePath, METADATA_DB_NAME);
+         this.metadataDb = connectionManager.getConnection(this.metadataPath);
+@@ -51,7 +52,7 @@
+         const row = stmt.get(scope, scopeHash);
+         if (!row)
+             return null;
+-        return {
++        const shard = {
+             id: row.id,
+             scope: row.scope,
+             scopeHash: row.scope_hash,
+@@ -61,6 +62,8 @@
+             isActive: row.is_active === 1,
+             createdAt: row.created_at,
+         };
++        this.ensureShardSchema(shard);
++        return shard;
+     }
+     getAllShards(scope, scopeHash) {
+         let stmt;
+@@ -81,7 +84,7 @@
+       `);
+             rows = stmt.all(scope, scopeHash);
+         }
+-        return rows.map((row) => ({
++        const shards = rows.map((row) => ({
+             id: row.id,
+             scope: row.scope,
+             scopeHash: row.scope_hash,
+@@ -91,6 +94,10 @@
+             isActive: row.is_active === 1,
+             createdAt: row.created_at,
+         }));
++        for (const shard of shards) {
++            this.ensureShardSchema(shard);
++        }
++        return shards;
+     }
+     createShard(scope, scopeHash, shardIndex) {
+         const fullPath = this.getShardPath(scope, scopeHash, shardIndex);
+@@ -147,14 +154,68 @@
+         project_path TEXT,
+         project_name TEXT,
+         git_repo_url TEXT,
+-        is_pinned INTEGER DEFAULT 0
++        is_pinned INTEGER DEFAULT 0,
++        is_staged INTEGER DEFAULT 0,
++        source TEXT,
++        authority TEXT,
++        observed_at INTEGER,
++        valid_until INTEGER
+       )
+     `);
++        this.migrateShardDb(db);
+         db.run(`CREATE INDEX IF NOT EXISTS idx_container_tag ON memories(container_tag)`);
+         db.run(`CREATE INDEX IF NOT EXISTS idx_type ON memories(type)`);
+         db.run(`CREATE INDEX IF NOT EXISTS idx_created_at ON memories(created_at DESC)`);
+         db.run(`CREATE INDEX IF NOT EXISTS idx_is_pinned ON memories(is_pinned)`);
++        db.run(`CREATE INDEX IF NOT EXISTS idx_is_staged ON memories(is_staged)`);
+     }
++    /**
++     * P1 migration: add staging / evidence-chain / soft-invalidation columns to
++     * pre-existing shard DBs. ADD COLUMN is additive and non-destructive; the
++     * table_info guard makes the migration idempotent. Fresh shards get these
++     * columns directly from the CREATE TABLE above.
++     */
++    migrateShardDb(db) {
++        try {
++            const cols = new Set(db.prepare(`PRAGMA table_info(memories)`).all().map((c) => c.name));
++            const additions = [
++                ["is_staged", "INTEGER DEFAULT 0"],
++                ["source", "TEXT"],
++                ["authority", "TEXT"],
++                ["observed_at", "INTEGER"],
++                ["valid_until", "INTEGER"],
++            ];
++            for (const [name, ddl] of additions) {
++                if (!cols.has(name)) {
++                    db.run(`ALTER TABLE memories ADD COLUMN ${name} ${ddl}`);
++                    log("Shard schema migrated: column added", { column: name });
++                }
++            }
++            db.run(`CREATE INDEX IF NOT EXISTS idx_is_staged ON memories(is_staged)`);
++        }
++        catch (error) {
++            log("Shard schema migration failed", { error: String(error) });
++        }
++    }
++    /**
++     * Ensure a single shard carries the current schema. Runs at most once per
++     * process per shard (cheap Set guard); called from the shard resolution
++     * points so existing DBs are migrated lazily on first touch.
++     */
++    ensureShardSchema(shard) {
++        if (this.migratedShardPaths.has(shard.dbPath))
++            return;
++        if (!existsSync(shard.dbPath))
++            return;
++        try {
++            const db = connectionManager.getConnection(shard.dbPath);
++            this.migrateShardDb(db);
++            this.migratedShardPaths.add(shard.dbPath);
++        }
++        catch (error) {
++            log("Error ensuring shard schema", { dbPath: shard.dbPath, error: String(error) });
++        }
++    }
+     isShardValid(shard) {
+         if (!existsSync(shard.dbPath)) {
+             log("Shard DB file missing", { dbPath: shard.dbPath, shardId: shard.id });
+--- a/dist/services/sqlite/shard-manager.d.ts
++++ b/dist/services/sqlite/shard-manager.d.ts
+@@ -2,6 +2,7 @@
+ export declare class ShardManager {
+     private metadataDb;
+     private metadataPath;
++    private migratedShardPaths;
+     constructor();
+     private initMetadataDb;
+     private getShardPath;
+@@ -10,6 +11,8 @@
+     getAllShards(scope: "user" | "project", scopeHash: string): ShardInfo[];
+     createShard(scope: "user" | "project", scopeHash: string, shardIndex: number): ShardInfo;
+     private initShardDb;
++    private migrateShardDb;
++    private ensureShardSchema;
+     private isShardValid;
+     private ensureShardTables;
+     getWriteShard(scope: "user" | "project", scopeHash: string): ShardInfo;
+--- a/dist/services/sqlite/vector-search.js
++++ b/dist/services/sqlite/vector-search.js
+@@ -5,6 +5,10 @@
+ import { createVectorBackend } from "../vector-backends/backend-factory.js";
+ import { ExactScanBackend } from "../vector-backends/exact-scan-backend.js";
+ const Database = getDatabase();
++// P1: rows awaiting human review (is_staged) or soft-invalidated (valid_until
++// set after a merge/conflict) must never surface in retrieval or injection.
++// Review/history surfaces (WebUI list, migration export) opt out explicitly.
++const RETRIEVABLE_SQL = `COALESCE(is_staged, 0) = 0 AND COALESCE(valid_until, 0) = 0`;
+ function toBlob(vector) {
+     return vector ? new Uint8Array(vector.buffer) : null;
+ }
+@@ -24,10 +28,11 @@
+         const insertMemory = db.prepare(`
+       INSERT INTO memories (
+         id, content, vector, tags_vector, container_tag, tags, type, created_at, updated_at,
+-        metadata, display_name, user_name, user_email, project_path, project_name, git_repo_url
+-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++        metadata, display_name, user_name, user_email, project_path, project_name, git_repo_url,
++        is_staged, source, authority, observed_at, valid_until
++      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     `);
+-        insertMemory.run(record.id, record.content, toBlob(record.vector), toBlob(record.tagsVector), record.containerTag, record.tags || null, record.type || null, record.createdAt, record.updatedAt, record.metadata || null, record.displayName || null, record.userName || null, record.userEmail || null, record.projectPath || null, record.projectName || null, record.gitRepoUrl || null);
++        insertMemory.run(record.id, record.content, toBlob(record.vector), toBlob(record.tagsVector), record.containerTag, record.tags || null, record.type || null, record.createdAt, record.updatedAt, record.metadata || null, record.displayName || null, record.userName || null, record.userEmail || null, record.projectPath || null, record.projectName || null, record.gitRepoUrl || null, record.isStaged ? 1 : 0, record.source || null, record.authority || null, record.observedAt || null, record.validUntil || null);
+         try {
+             if (shard) {
+                 const backend = await this.getBackend();
+@@ -109,11 +114,11 @@
+             .prepare(containerTag === ""
+             ? `
+       SELECT * FROM memories
+-      WHERE id IN (${placeholders})
++      WHERE id IN (${placeholders}) AND ${RETRIEVABLE_SQL}
+     `
+             : `
+       SELECT * FROM memories
+-      WHERE id IN (${placeholders}) AND container_tag = ?
++      WHERE id IN (${placeholders}) AND container_tag = ? AND ${RETRIEVABLE_SQL}
+     `)
+             .all(...ids, ...(containerTag === "" ? [] : [containerTag]));
+         const queryWords = queryText
+@@ -188,16 +193,18 @@
+             }
+         }
+     }
+-    listMemories(db, containerTag, limit) {
++    listMemories(db, containerTag, limit, options = {}) {
++        const filter = options.includeNonRetrievable ? "" : ` AND ${RETRIEVABLE_SQL}`;
+         const stmt = db.prepare(containerTag === ""
+             ? `
+       SELECT * FROM memories
++      WHERE 1 = 1${filter}
+       ORDER BY created_at DESC
+       LIMIT ?
+     `
+             : `
+       SELECT * FROM memories
+-      WHERE container_tag = ?
++      WHERE container_tag = ?${filter}
+       ORDER BY created_at DESC
+       LIMIT ?
+     `);
+@@ -214,7 +221,7 @@
+     getMemoriesBySessionID(db, sessionID) {
+         const stmt = db.prepare(`
+       SELECT * FROM memories
+-      WHERE metadata LIKE ?
++      WHERE metadata LIKE ? AND ${RETRIEVABLE_SQL}
+       ORDER BY created_at DESC
+     `);
+         const rows = stmt.all(`%"sessionID":"${sessionID}"%`);
+--- a/dist/services/sqlite/vector-search.d.ts
++++ b/dist/services/sqlite/vector-search.d.ts
+@@ -12,7 +12,9 @@
+     searchAcrossShards(shards: ShardInfo[], queryVector: Float32Array, containerTag: string, limit: number, similarityThreshold: number, queryText?: string): Promise<SearchResult[]>;
+     deleteVector(db: DatabaseType, memoryId: string, shard?: ShardInfo): Promise<void>;
+     updateVector(db: DatabaseType, memoryId: string, vector: Float32Array, shard?: ShardInfo, tagsVector?: Float32Array): Promise<void>;
+-    listMemories(db: DatabaseType, containerTag: string, limit: number): any[];
++    listMemories(db: DatabaseType, containerTag: string, limit: number, options?: {
++        includeNonRetrievable?: boolean;
++    }): any[];
+     getAllMemories(db: DatabaseType): any[];
+     getMemoryById(db: DatabaseType, memoryId: string): any | null;
+     getMemoriesBySessionID(db: DatabaseType, sessionID: string): any[];
+--- a/dist/services/sqlite/types.d.ts
++++ b/dist/services/sqlite/types.d.ts
+@@ -25,6 +25,11 @@
+     projectPath?: string;
+     projectName?: string;
+     gitRepoUrl?: string;
++    isStaged?: number;
++    source?: string;
++    authority?: string;
++    observedAt?: number;
++    validUntil?: number;
+ }
+ export interface SearchResult {
+     id: string;
+--- a/dist/services/web-server.js
++++ b/dist/services/web-server.js
+@@ -5,7 +5,7 @@
+ import { fileURLToPath } from "node:url";
+ import { log } from "./logger.js";
+ import { corsPreflightResponse, disallowedCorsResponse, isAllowedBrowserOrigin } from "./cors.js";
+-import { handleListTags, handleListMemories, handleAddMemory, handleDeleteMemory, handleBulkDelete, handleUpdateMemory, handleSearch, handleStats, handlePinMemory, handleUnpinMemory, handleRunCleanup, handleRunDeduplication, handleDetectMigration, handleRunMigration, handleDetectTagMigration, handleRunTagMigrationBatch, handleGetTagMigrationProgress, handleDeletePrompt, handleBulkDeletePrompts, handleGetUserProfile, handleGetProfileChangelog, handleGetProfileSnapshot, handleRefreshProfile, handleAICleanup, handleApplyCleanup, handleUpdateProfileItem, } from "./api-handlers.js";
++import { handleListTags, handleListMemories, handleAddMemory, handleDeleteMemory, handleBulkDelete, handleUpdateMemory, handleMergeMemories, handleSearch, handleStats, handlePinMemory, handleUnpinMemory, handleRunCleanup, handleRunDeduplication, handleDetectMigration, handleRunMigration, handleDetectTagMigration, handleRunTagMigrationBatch, handleGetTagMigrationProgress, handleDeletePrompt, handleBulkDeletePrompts, handleGetUserProfile, handleGetProfileChangelog, handleGetProfileSnapshot, handleRefreshProfile, handleAICleanup, handleApplyCleanup, handleUpdateProfileItem, } from "./api-handlers.js";
+ const isBun = typeof globalThis.Bun !== "undefined";
+ function serveFetch(opts) {
+     if (isBun) {
+@@ -294,6 +294,11 @@
+                 const result = await handleBulkDelete(body.ids || [], cascade);
+                 return this.jsonResponse(result);
+             }
++            if (path === "/api/memories/merge" && method === "POST") {
++                const body = (await req.json());
++                const result = await handleMergeMemories(body);
++                return this.jsonResponse(result);
++            }
+             if (path === "/api/search" && method === "GET") {
+                 const query = url.searchParams.get("q");
+                 const tag = url.searchParams.get("tag") || undefined;
+--- a/dist/services/migration-service.js
++++ b/dist/services/migration-service.js
+@@ -166,6 +166,11 @@
+                         projectName: memory.project_name,
+                         gitRepoUrl: memory.git_repo_url,
+                         isPinned: memory.is_pinned || 0,
++                        isStaged: memory.is_staged || 0,
++                        source: memory.source,
++                        authority: memory.authority,
++                        observedAt: memory.observed_at,
++                        validUntil: memory.valid_until,
+                     });
+                 }
+                 await shardManager.deleteShard(shardInfo.shardId);
+@@ -191,6 +196,11 @@
+                             projectPath: memory.projectPath || undefined,
+                             projectName: memory.projectName || undefined,
+                             gitRepoUrl: memory.gitRepoUrl || undefined,
++                            isStaged: memory.isStaged,
++                            source: memory.source || undefined,
++                            authority: memory.authority || undefined,
++                            observedAt: memory.observedAt || undefined,
++                            validUntil: memory.validUntil || undefined,
+                         }, newShard);
+                         if (memory.isPinned === 1) {
+                             vectorSearch.pinMemory(newDb, memory.id);
+--- a/dist/services/deduplication-service.js
++++ b/dist/services/deduplication-service.js
+@@ -22,7 +22,9 @@
+             const nearDuplicateGroups = [];
+             for (const shard of allShards) {
+                 const db = connectionManager.getConnection(shard.dbPath);
+-                const memories = vectorSearch.getAllMemories(db);
++                // P1: staged/invalidated rows are not dedup candidates — a staged
++                // proposal must not shadow (or be shadowed by) active memories.
++                const memories = vectorSearch.getAllMemories(db).filter((m) => !Number(m.is_staged) && !Number(m.valid_until));
+                 const contentMap = new Map();
+                 for (const memory of memories) {
+                     const key = `${memory.container_tag}:${memory.content}`;
+--- a/dist/services/cleanup-service.js
++++ b/dist/services/cleanup-service.js
+@@ -49,7 +49,7 @@
+                 const oldMemories = db
+                     .prepare(`
+           SELECT id, container_tag, is_pinned FROM memories 
+-          WHERE updated_at < ?
++          WHERE updated_at < ? AND COALESCE(is_staged, 0) = 0
+         `)
+                     .all(cutoffTime);
+                 for (const memory of oldMemories) {

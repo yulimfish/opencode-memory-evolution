@@ -1,0 +1,840 @@
+diff -ruN a/dist/config.d.ts b/dist/config.d.ts
+--- a/dist/config.d.ts	2026-09-12 22:13:46
++++ b/dist/config.d.ts	2026-09-12 22:13:46
+@@ -13,6 +13,7 @@
+     similarityThreshold?: number;
+     maxMemories?: number;
+     injectProfile?: boolean;
++    injectProfileTokenBudget?: number;
+     containerTagPrefix?: string;
+     autoCaptureEnabled?: boolean;
+     autoCaptureMaxIterations?: number;
+@@ -64,6 +65,11 @@
+         excludeCurrentSession?: boolean;
+         maxAgeDays?: number;
+         injectOn?: "first" | "always";
++        retrieval?: "hybrid" | "recency";
++        gateEnabled?: boolean;
++        candidates?: number;
++        minScore?: number;
++        injectionTokenBudget?: number;
+     };
+ }
+ declare function buildConfig(fileConfig: OpenCodeMemConfig): {
+@@ -77,6 +83,7 @@
+     similarityThreshold: number;
+     maxMemories: number;
+     injectProfile: boolean;
++    injectProfileTokenBudget: number;
+     containerTagPrefix: string;
+     autoCaptureEnabled: boolean;
+     autoCaptureMaxIterations: number;
+@@ -132,6 +139,11 @@
+         excludeCurrentSession: boolean | undefined;
+         maxAgeDays: number | undefined;
+         injectOn: "first" | "always";
++        retrieval: "hybrid" | "recency";
++        gateEnabled: boolean | undefined;
++        candidates: number | undefined;
++        minScore: number | undefined;
++        injectionTokenBudget: number | undefined;
+     };
+ };
+ export declare let CONFIG: {
+@@ -145,6 +157,7 @@
+     similarityThreshold: number;
+     maxMemories: number;
+     injectProfile: boolean;
++    injectProfileTokenBudget: number;
+     containerTagPrefix: string;
+     autoCaptureEnabled: boolean;
+     autoCaptureMaxIterations: number;
+@@ -200,6 +213,11 @@
+         excludeCurrentSession: boolean | undefined;
+         maxAgeDays: number | undefined;
+         injectOn: "first" | "always";
++        retrieval: "hybrid" | "recency";
++        gateEnabled: boolean | undefined;
++        candidates: number | undefined;
++        minScore: number | undefined;
++        injectionTokenBudget: number | undefined;
+     };
+ };
+ type RuntimeConfig = ReturnType<typeof buildConfig>;
+diff -ruN a/dist/config.js b/dist/config.js
+--- a/dist/config.js	2026-09-12 22:13:46
++++ b/dist/config.js	2026-09-12 22:13:46
+@@ -68,7 +68,13 @@
+         excludeCurrentSession: true,
+         maxAgeDays: undefined,
+         injectOn: "first",
++        retrieval: "hybrid",
++        gateEnabled: true,
++        candidates: 24,
++        minScore: 0.3,
++        injectionTokenBudget: 600,
+     },
++    injectProfileTokenBudget: 250,
+ };
+ function expandPath(path) {
+     if (path.startsWith("~/")) {
+@@ -344,7 +350,26 @@
+   // ============================================
+   
+   // Inject user profile into AI context (preferences, patterns, workflows)
+-  "injectProfile": true
++  "injectProfile": true,
++
++  // ============================================
++  // Automatic Injection (chat.message, P2)
++  // ============================================
++
++  // Retrieval mode for automatic injection: "hybrid" = vector + lexical +
++  // importance + time fit, "recency" = legacy newest-first list.
++  // "chatMessage": {
++  //   "enabled": true,
++  //   "maxMemories": 3,
++  //   "injectOn": "first",
++  //   "retrieval": "hybrid",
++  //   "gateEnabled": true,
++  //   "minScore": 0.3,
++  //   "injectionTokenBudget": 600
++  // },
++
++  // Token budget for the injected user profile (index-style content).
++  "injectProfileTokenBudget": 250
+ }
+ `;
+ function ensureConfigExists() {
+@@ -478,7 +503,13 @@
+             excludeCurrentSession: fileConfig.chatMessage?.excludeCurrentSession ?? DEFAULTS.chatMessage.excludeCurrentSession,
+             maxAgeDays: fileConfig.chatMessage?.maxAgeDays,
+             injectOn: (fileConfig.chatMessage?.injectOn ?? DEFAULTS.chatMessage.injectOn),
++            retrieval: (fileConfig.chatMessage?.retrieval ?? DEFAULTS.chatMessage.retrieval),
++            gateEnabled: fileConfig.chatMessage?.gateEnabled ?? DEFAULTS.chatMessage.gateEnabled,
++            candidates: fileConfig.chatMessage?.candidates ?? DEFAULTS.chatMessage.candidates,
++            minScore: fileConfig.chatMessage?.minScore ?? DEFAULTS.chatMessage.minScore,
++            injectionTokenBudget: fileConfig.chatMessage?.injectionTokenBudget ?? DEFAULTS.chatMessage.injectionTokenBudget,
+         },
++        injectProfileTokenBudget: fileConfig.injectProfileTokenBudget ?? DEFAULTS.injectProfileTokenBudget,
+     };
+ }
+ let _globalFileConfig = loadConfigFromPaths(CONFIG_FILES);
+diff -ruN a/dist/index.js b/dist/index.js
+--- a/dist/index.js	2026-09-12 22:13:46
++++ b/dist/index.js	2026-09-12 22:13:46
+@@ -1,6 +1,7 @@
+ import { tool } from "@opencode-ai/plugin";
+ import { memoryClient } from "./services/client.js";
+ import { formatContextForPrompt } from "./services/context.js";
++import { estimateTokens, shouldInjectGate } from "./services/hybrid-search.js";
+ import { getTags } from "./services/tags.js";
+ import { stripPrivateContent, isFullyPrivate } from "./services/privacy.js";
+ import { performAutoCapture } from "./services/auto-capture.js";
+@@ -216,8 +217,50 @@
+                             !m.parts.every((p) => p.type !== "text" || p.synthetic === true)).length === 1);
+                 if (!shouldInject)
+                     return;
+-                const listResult = await memoryClient.listMemories(tags.project.tag, CONFIG.chatMessage.maxMemories);
+-                let memories = listResult.success ? listResult.memories : [];
++                // P2: injection gate — self-contained turns (greetings, bare
++                // commands, pure chatter) skip retrieval entirely. The
++                // post-compaction re-injection is a deliberate restore point
++                // and is never gated.
++                if (!isAfterCompaction && CONFIG.chatMessage.gateEnabled) {
++                    const gate = shouldInjectGate(userMessage);
++                    if (!gate.inject) {
++                        log("chat.message: injection skipped by gate", { reason: gate.reason });
++                        return;
++                    }
++                }
++                // P2: hybrid retrieval (vector + lexical + importance + time
++                // fit), falling back to the legacy recency list when the
++                // embedding/search path is unavailable.
++                let memories = [];
++                let usedHybrid = false;
++                if (CONFIG.chatMessage.retrieval !== "recency") {
++                    const hybridResult = await memoryClient.searchForInjection(userMessage, tags.project.tag);
++                    if (hybridResult.success) {
++                        usedHybrid = true;
++                        memories = hybridResult.memories.map((m) => ({
++                            ...m,
++                            summary: m.content ?? m.memory ?? "",
++                            similarity: m.scores?.final ?? m.similarity ?? 0,
++                        }));
++                    }
++                }
++                if (!usedHybrid) {
++                    const listResult = await memoryClient.listMemories(tags.project.tag, CONFIG.chatMessage.maxMemories);
++                    memories = listResult.success ? listResult.memories : [];
++                    const budget = CONFIG.chatMessage.injectionTokenBudget ?? 0;
++                    if (budget > 0 && memories.length > 1) {
++                        const capped = [];
++                        let used = 0;
++                        for (const m of memories) {
++                            const cost = estimateTokens(m.summary);
++                            if (capped.length > 0 && used + cost > budget)
++                                break;
++                            capped.push(m);
++                            used += cost;
++                        }
++                        memories = capped;
++                    }
++                }
+                 if (CONFIG.chatMessage.excludeCurrentSession) {
+                     memories = memories.filter((m) => m.metadata?.sessionID !== input.sessionID);
+                 }
+@@ -229,8 +272,8 @@
+                     return;
+                 const projectMemories = {
+                     results: memories.map((m) => ({
+-                        similarity: 1.0,
+-                        memory: m.summary,
++                        similarity: typeof m.similarity === "number" ? m.similarity : 1.0,
++                        memory: m.summary ?? m.content ?? "",
+                     })),
+                     total: memories.length,
+                     timing: 0,
+@@ -247,6 +290,9 @@
+                         synthetic: true,
+                     };
+                     output.parts.unshift(contextPart);
++                    if (usedHybrid) {
++                        memoryClient.recordInjection(memories.map((m) => m.id)).catch(() => { });
++                    }
+                 }
+             }
+             catch (error) {
+diff -ruN a/dist/services/client.d.ts b/dist/services/client.d.ts
+--- a/dist/services/client.d.ts	2026-09-12 22:13:46
++++ b/dist/services/client.d.ts	2026-09-12 22:13:46
+@@ -123,6 +123,18 @@
+         total: number;
+         timing: number;
+     }>;
++    searchForInjection(query: string, containerTag: string, scope?: string): Promise<{
++        success: true;
++        memories: any[];
++    } | {
++        success: false;
++        error: string;
++        memories: never[];
++    }>;
++    recordInjection(memoryIds: string[]): Promise<{
++        success: boolean;
++        error?: string;
++    }>;
+     mergeMemories(ids: string[], content: string, options?: {
+         tags?: string[];
+         type?: string;
+diff -ruN a/dist/services/client.js b/dist/services/client.js
+--- a/dist/services/client.js	2026-09-12 22:13:46
++++ b/dist/services/client.js	2026-09-12 22:13:46
+@@ -2,6 +2,7 @@
+ import { shardManager } from "./sqlite/shard-manager.js";
+ import { vectorSearch } from "./sqlite/vector-search.js";
+ import { connectionManager } from "./sqlite/connection-manager.js";
++import { rankMemories } from "./hybrid-search.js";
+ import { CONFIG } from "../config.js";
+ import { log } from "./logger.js";
+ function safeToISOString(timestamp) {
+@@ -102,6 +103,69 @@
+             const errorMessage = error instanceof Error ? error.message : String(error);
+             log("searchMemories: error", { error: errorMessage });
+             return { success: false, error: errorMessage, results: [], total: 0, timing: 0 };
++        }
++    }
++    /**
++     * P2: hybrid candidate retrieval for automatic injection. Vector search
++     * collects candidates, then rankMemories re-scores them with lexical
++     * overlap, importance (recency / pinned / authority / injection frequency)
++     * and time fit parsed from the query. Callers fall back to listMemories
++     * (recency) when this returns success: false.
++     */
++    async searchForInjection(query, containerTag, scope = "project") {
++        try {
++            await this.initialize();
++            const cfg = CONFIG.chatMessage ?? {};
++            const candidates = cfg.candidates ?? 24;
++            const queryVector = await embeddingService.embedWithTimeout(query);
++            const resolved = resolveScopeValue(scope, containerTag);
++            const shards = shardManager.getAllShards(resolved.scope, resolved.hash);
++            if (shards.length === 0) {
++                return { success: true, memories: [] };
++            }
++            const results = await vectorSearch.searchAcrossShards(shards, queryVector, scope === "all-projects" ? "" : containerTag, candidates, 0, query);
++            const memories = rankMemories(results, query, {
++                maxItems: cfg.maxMemories,
++                tokenBudget: cfg.injectionTokenBudget,
++                minScore: cfg.minScore,
++            });
++            return { success: true, memories };
++        }
++        catch (error) {
++            const errorMessage = error instanceof Error ? error.message : String(error);
++            log("searchForInjection: error", { error: errorMessage });
++            return { success: false, error: errorMessage, memories: [] };
++        }
++    }
++    /**
++     * P2: best-effort retrieval-frequency counter for memories that were just
++     * injected. A failed update must never affect the injection path.
++     */
++    async recordInjection(memoryIds) {
++        if (!memoryIds || memoryIds.length === 0)
++            return { success: true };
++        try {
++            await this.initialize();
++            const shards = [...shardManager.getAllShards("user", ""), ...shardManager.getAllShards("project", "")];
++            const remaining = new Set(memoryIds);
++            const now = Date.now();
++            for (const shard of shards) {
++                if (remaining.size === 0)
++                    break;
++                const db = connectionManager.getConnection(shard.dbPath);
++                for (const id of Array.from(remaining)) {
++                    if (vectorSearch.getMemoryById(db, id)) {
++                        vectorSearch.incrementInjectCount(db, id, now);
++                        remaining.delete(id);
++                    }
++                }
++            }
++            return { success: true };
++        }
++        catch (error) {
++            const errorMessage = error instanceof Error ? error.message : String(error);
++            log("recordInjection: error", { error: errorMessage });
++            return { success: false, error: errorMessage };
+         }
+     }
+     async addMemory(content, containerTag, metadata) {
+diff -ruN a/dist/services/context.js b/dist/services/context.js
+--- a/dist/services/context.js	2026-09-12 22:13:46
++++ b/dist/services/context.js	2026-09-12 22:13:46
+@@ -1,11 +1,18 @@
+ import { CONFIG } from "../config.js";
+ import { getUserProfileContext } from "./user-profile/profile-context.js";
++import { truncateTextToTokens } from "./hybrid-search.js";
+ export function formatContextForPrompt(userId, projectMemories) {
+     const parts = ["[MEMORY]"];
+     if (CONFIG.injectProfile && userId) {
+         const profileContext = getUserProfileContext(userId);
+         if (profileContext) {
+-            parts.push("\n" + profileContext);
++            // P2: index-style content (profile) has its own token budget,
++            // separate from the per-memory injection budget.
++            const profileBudget = CONFIG.injectProfileTokenBudget ?? 0;
++            const capped = profileBudget > 0 ? truncateTextToTokens(profileContext, profileBudget) : profileContext;
++            if (capped) {
++                parts.push("\n" + capped);
++            }
+         }
+     }
+     const projectResults = projectMemories.results || [];
+diff -ruN a/dist/services/hybrid-search.d.ts b/dist/services/hybrid-search.d.ts
+--- a/dist/services/hybrid-search.d.ts	1970-01-01 08:00:00
++++ b/dist/services/hybrid-search.d.ts	2026-09-12 22:13:46
+@@ -0,0 +1,27 @@
++export declare function estimateTokens(text: string): number;
++export declare function truncateTextToTokens(text: string, budget: number): string;
++export declare function tokenizeQuery(text: string): string[];
++export declare function lexicalScore(queryTokens: string[], memoryText: string | null | undefined, memoryTags: string[] | string | null | undefined): number;
++export interface TimeReference {
++    start: number;
++    end: number;
++    directional: boolean;
++    label: string;
++}
++export declare function parseTimeReference(text: string | null | undefined, now?: number): TimeReference | null;
++export declare function timeFitScore(createdAt: number | string, timeRef: TimeReference | null, now?: number): number;
++export declare function authorityScore(authority: string | null | undefined): number;
++export declare function recencyScore(createdAt: number | string, now?: number, halfLifeDays?: number): number;
++export declare function frequencyScore(injectCount: number | null | undefined): number;
++export declare function importanceScore(memory: Record<string, unknown>, now?: number): {
++    recency: number;
++    authority: number;
++    frequency: number;
++    pinned: number;
++    total: number;
++};
++export declare function rankMemories(candidates: unknown[], query: string, options?: Record<string, unknown>): any[];
++export declare function shouldInjectGate(message: string | null | undefined): {
++    inject: boolean;
++    reason: string;
++};
+diff -ruN a/dist/services/hybrid-search.js b/dist/services/hybrid-search.js
+--- a/dist/services/hybrid-search.js	1970-01-01 08:00:00
++++ b/dist/services/hybrid-search.js	2026-09-12 22:13:46
+@@ -0,0 +1,385 @@
++// P2: hybrid retrieval scoring for automatic injection.
++//
++// Replaces the recency-only injection ranking with:
++//   score = similarity (vector) + lexical overlap + importance + time fit
++// where importance = recency decay + pinned + authority + injection frequency,
++// and time fit is driven by time references parsed out of the user message
++// (e.g. "yesterday", "last week", "3 days ago", "2026-08-15").
++//
++// Everything here is pure (no DB / no network) so it can be unit-tested and
++// reused by the offline comparison harness.
++const DAY = 86400000;
++const CJK_RE = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/;
++// ---------------------------------------------------------------------------
++// Token estimation and text tokenization
++// ---------------------------------------------------------------------------
++export function estimateTokens(text) {
++    if (!text)
++        return 0;
++    let cjk = 0;
++    let otherChars = 0;
++    for (const ch of String(text)) {
++        if (CJK_RE.test(ch))
++            cjk++;
++        else
++            otherChars++;
++    }
++    return Math.max(1, cjk + Math.ceil(otherChars / 4));
++}
++export function truncateTextToTokens(text, budget) {
++    if (!text || budget <= 0)
++        return "";
++    if (estimateTokens(text) <= budget)
++        return text;
++    const lines = String(text).split("\n");
++    const kept = [];
++    let used = 0;
++    for (const line of lines) {
++        const cost = estimateTokens(line) + 1;
++        if (used + cost > budget)
++            break;
++        kept.push(line);
++        used += cost;
++    }
++    if (kept.length === 0)
++        return "";
++    return kept.join("\n") + "\n…";
++}
++export function tokenizeQuery(text) {
++    if (!text)
++        return [];
++    const lower = String(text).toLowerCase();
++    const tokens = new Set();
++    for (const word of lower.match(/[a-z0-9_][a-z0-9_.-]{1,}/g) || []) {
++        tokens.add(word);
++    }
++    for (const seq of lower.match(/[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]+/g) || []) {
++        if (seq.length === 1) {
++            tokens.add(seq);
++            continue;
++        }
++        for (let i = 0; i < seq.length - 1; i++) {
++            tokens.add(seq.slice(i, i + 2));
++        }
++    }
++    return Array.from(tokens);
++}
++export function lexicalScore(queryTokens, memoryText, memoryTags) {
++    if (!queryTokens || queryTokens.length === 0)
++        return 0;
++    const text = String(memoryText || "").toLowerCase();
++    const tagText = Array.isArray(memoryTags) ? memoryTags.join(",").toLowerCase() : String(memoryTags || "").toLowerCase();
++    let matched = 0;
++    for (const token of queryTokens) {
++        if (text.includes(token) || tagText.includes(token))
++            matched++;
++    }
++    return matched / queryTokens.length;
++}
++function jaccard(a, b) {
++    const sa = new Set(a);
++    const sb = new Set(b);
++    if (sa.size === 0 || sb.size === 0)
++        return 0;
++    let intersection = 0;
++    for (const token of sa) {
++        if (sb.has(token))
++            intersection++;
++    }
++    return intersection / (sa.size + sb.size - intersection);
++}
++// ---------------------------------------------------------------------------
++// Time reference parsing ("time-aware query expansion")
++// ---------------------------------------------------------------------------
++function startOfDay(ts) {
++    const d = new Date(ts);
++    d.setHours(0, 0, 0, 0);
++    return d.getTime();
++}
++function startOfWeek(ts) {
++    const d = new Date(startOfDay(ts));
++    const day = (d.getDay() + 6) % 7; // Monday = 0
++    return d.getTime() - day * DAY;
++}
++function startOfMonth(ts) {
++    const d = new Date(ts);
++    return new Date(d.getFullYear(), d.getMonth(), 1).getTime();
++}
++function startOfYear(ts) {
++    const d = new Date(ts);
++    return new Date(d.getFullYear(), 0, 1).getTime();
++}
++function addMonths(ts, n) {
++    const d = new Date(ts);
++    return new Date(d.getFullYear(), d.getMonth() + n, d.getDate()).getTime();
++}
++export function parseTimeReference(text, now = Date.now()) {
++    if (!text)
++        return null;
++    const t = String(text).toLowerCase();
++    let start = null;
++    let end = null;
++    let directional = false;
++    let label = null;
++    const setWindow = (s, e, name) => {
++        start = start === null ? s : Math.min(start, s);
++        end = end === null ? e : Math.max(end, e);
++        label = label ? `${label}+${name}` : name;
++    };
++    // "N days/weeks/months/years ago" and Chinese equivalents.
++    const agoRe = /(\d+)\s*(天|日|周|星期|个?月|年)\s*(前|之前)/g;
++    for (const m of t.matchAll(agoRe)) {
++        const n = Number(m[1]);
++        const unit = m[2];
++        const anchor = now - n * (unit.includes("月") ? 30 * DAY : unit.includes("年") ? 365 * DAY : unit.includes("周") || unit.includes("星期") ? 7 * DAY : DAY);
++        setWindow(startOfDay(anchor), startOfDay(anchor) + DAY, `${n}${unit}前`);
++    }
++    const agoEnRe = /(\d+)\s*(day|week|month|year)s?\s+ago/g;
++    for (const m of t.matchAll(agoEnRe)) {
++        const n = Number(m[1]);
++        const unit = m[2];
++        const anchor = now - n * (unit === "month" ? 30 * DAY : unit === "year" ? 365 * DAY : unit === "week" ? 7 * DAY : DAY);
++        setWindow(startOfDay(anchor), startOfDay(anchor) + DAY, `${n} ${unit} ago`);
++    }
++    // Full Chinese date first: 2026年8月15日 — consumed so the month-day and
++    // year-month rules below do not widen it to the whole month.
++    let scan = t;
++    for (const m of t.matchAll(/(\d{4})年(\d{1,2})月(\d{1,2})[日号]/g)) {
++        const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
++        setWindow(d.getTime(), d.getTime() + DAY, m[0]);
++        scan = scan.replace(m[0], " ");
++    }
++    // ISO-ish dates: 2026-08-15 / 2026/8/15 / 2026.8.15
++    for (const m of t.matchAll(/(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/g)) {
++        const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
++        setWindow(d.getTime(), d.getTime() + DAY, m[0]);
++    }
++    // Chinese month-day: 8月15日 (current year assumed)
++    for (const m of scan.matchAll(/(\d{1,2})月(\d{1,2})[日号]/g)) {
++        const d = new Date(new Date(now).getFullYear(), Number(m[1]) - 1, Number(m[2]));
++        setWindow(d.getTime(), d.getTime() + DAY, m[0]);
++    }
++    // Chinese year-month: 2026年8月
++    for (const m of scan.matchAll(/(\d{4})年(\d{1,2})月/g)) {
++        const d = new Date(Number(m[1]), Number(m[2]) - 1, 1);
++        setWindow(d.getTime(), addMonths(d.getTime(), 1), m[0]);
++    }
++    const fixed = [
++        [/今天|今日|\btoday\b/, () => setWindow(startOfDay(now), now, "today")],
++        [/昨天|昨日|\byesterday\b/, () => setWindow(startOfDay(now - DAY), startOfDay(now), "yesterday")],
++        [/前天/, () => setWindow(startOfDay(now - 2 * DAY), startOfDay(now - DAY), "before yesterday")],
++        [/上周|上星期|\blast week\b/, () => setWindow(startOfWeek(now) - 7 * DAY, startOfWeek(now), "last week")],
++        [/这周|本周|这星期|\bthis week\b/, () => setWindow(startOfWeek(now), now, "this week")],
++        [/上个月|上月|\blast month\b/, () => setWindow(startOfMonth(addMonths(startOfMonth(now), -1)), startOfMonth(now), "last month")],
++        [/这个月|本月|\bthis month\b/, () => setWindow(startOfMonth(now), now, "this month")],
++        [/去年|\blast year\b/, () => setWindow(startOfYear(new Date(now).setFullYear(new Date(now).getFullYear() - 1)), startOfYear(now), "last year")],
++        [/今年|\bthis year\b/, () => setWindow(startOfYear(now), now, "this year")],
++        [/刚才|刚刚|\bjust now\b/, () => setWindow(now - 2 * 3600000, now, "just now")],
++    ];
++    for (const [re, fn] of fixed) {
++        if (re.test(t))
++            fn();
++    }
++    // Directional recent refs: no absolute window, only "prefer fresh".
++    if (/最近|近期|近日|这几天|\brecently\b|\blately\b|\bthese days\b/.test(t)) {
++        directional = true;
++        setWindow(now - 7 * DAY, now, "recent");
++    }
++    if (/上次|上一次|\blast time\b|\bthe other day\b/.test(t)) {
++        directional = true;
++        setWindow(now - 14 * DAY, now, "last time");
++    }
++    if (start === null)
++        return null;
++    return { start, end: end === null ? now : end, directional, label: label || "time" };
++}
++export function timeFitScore(createdAt, timeRef, now = Date.now()) {
++    if (!timeRef)
++        return 0;
++    const created = Number(createdAt) || 0;
++    if (created <= 0)
++        return 0;
++    if (created >= timeRef.start && created <= timeRef.end)
++        return 1;
++    const excessDays = created < timeRef.start
++        ? (timeRef.start - created) / DAY
++        : (created - timeRef.end) / DAY;
++    const halfLife = timeRef.directional ? 14 : 3;
++    return Math.pow(0.5, excessDays / halfLife);
++}
++// ---------------------------------------------------------------------------
++// Importance
++// ---------------------------------------------------------------------------
++const AUTHORITY_SCORES = {
++    user: 1.0,
++    verified: 0.9,
++    trusted: 0.9,
++    observed: 0.65,
++    agent: 0.4,
++    inferred: 0.35,
++};
++export function authorityScore(authority) {
++    if (!authority)
++        return 0.5;
++    return AUTHORITY_SCORES[String(authority).trim().toLowerCase()] ?? 0.5;
++}
++export function recencyScore(createdAt, now = Date.now(), halfLifeDays = 45) {
++    const created = Number(createdAt) || 0;
++    if (created <= 0)
++        return 0;
++    const ageDays = Math.max(0, (now - created) / DAY);
++    return Math.pow(0.5, ageDays / halfLifeDays);
++}
++export function frequencyScore(injectCount) {
++    const n = Math.max(0, Number(injectCount) || 0);
++    if (n === 0)
++        return 0;
++    return Math.min(1, Math.log1p(n) / Math.log1p(8));
++}
++export function importanceScore(memory, now = Date.now()) {
++    const recency = recencyScore(memory.createdAt, now);
++    const authority = authorityScore(memory.authority);
++    const frequency = frequencyScore(memory.injectCount);
++    const pinned = Number(memory.isPinned) ? 1 : 0;
++    return { recency, authority, frequency, pinned, total: 0.35 * recency + 0.25 * authority + 0.15 * frequency + 0.25 * pinned };
++}
++// ---------------------------------------------------------------------------
++// Ranking
++// ---------------------------------------------------------------------------
++const DEFAULT_WEIGHTS = { similarity: 0.62, lexical: 0.16, importance: 0.22, time: 0 };
++const TIME_WEIGHTS = { similarity: 0.5, lexical: 0.14, importance: 0.16, time: 0.2 };
++function normalizeMemory(memory) {
++    const tags = Array.isArray(memory.tags)
++        ? memory.tags
++        : typeof memory.tags === "string" && memory.tags.length > 0
++            ? memory.tags.split(",")
++            : [];
++    const createdAtRaw = memory.createdAt ?? memory.created_at;
++    const createdAt = typeof createdAtRaw === "string" ? Date.parse(createdAtRaw) : Number(createdAtRaw) || 0;
++    return {
++        id: memory.id,
++        content: memory.content ?? memory.memory ?? "",
++        tags,
++        createdAt,
++        isPinned: Number(memory.isPinned ?? memory.is_pinned) || 0,
++        authority: memory.authority ?? null,
++        source: memory.source ?? null,
++        injectCount: Number(memory.injectCount ?? memory.inject_count) || 0,
++        similarity: Number(memory.similarity) || 0,
++        metadata: memory.metadata,
++    };
++}
++export function rankMemories(candidates, query, options = {}) {
++    const now = options.now ?? Date.now();
++    const timeRef = options.timeRef !== undefined ? options.timeRef : parseTimeReference(query, now);
++    const weights = options.weights ?? (timeRef ? TIME_WEIGHTS : DEFAULT_WEIGHTS);
++    const queryTokens = tokenizeQuery(query);
++    const scored = (candidates || []).map((raw) => {
++        const memory = normalizeMemory(raw);
++        const importance = importanceScore(memory, now);
++        const lexical = lexicalScore(queryTokens, memory.content, memory.tags);
++        const time = timeFitScore(memory.createdAt, timeRef, now);
++        const final = weights.similarity * memory.similarity +
++            weights.lexical * lexical +
++            weights.importance * importance.total +
++            weights.time * time;
++        return {
++            ...memory,
++            scores: {
++                similarity: memory.similarity,
++                lexical,
++                importance: importance.total,
++                recency: importance.recency,
++                authority: importance.authority,
++                frequency: importance.frequency,
++                pinned: importance.pinned,
++                time,
++                final,
++            },
++            tokens: estimateTokens(memory.content),
++        };
++    });
++    scored.sort((a, b) => b.scores.final - a.scores.final || b.createdAt - a.createdAt);
++    const minScore = options.minScore ?? 0;
++    const filtered = minScore > 0 ? scored.filter((m) => m.scores.final >= minScore) : scored.slice();
++    const maxItems = Math.max(1, options.maxItems ?? 3);
++    const tokenBudget = options.tokenBudget ?? 0;
++    // Light MMR: near-duplicate memories (same feature described three times)
++    // should not fill the whole injection slot. Penalize a candidate by its
++    // highest content overlap with an already-selected memory.
++    const diversityFactor = options.diversityFactor ?? 0.45;
++    const tokensOf = new Map();
++    if (diversityFactor > 0) {
++        for (const memory of filtered) {
++            tokensOf.set(memory, tokenizeQuery(memory.content));
++        }
++    }
++    const selected = [];
++    const excluded = new Set();
++    let usedTokens = 0;
++    while (selected.length < maxItems) {
++        let best = null;
++        let bestAdjusted = -Infinity;
++        for (const memory of filtered) {
++            if (selected.includes(memory) || excluded.has(memory))
++                continue;
++            let adjusted = memory.scores.final;
++            if (diversityFactor > 0) {
++                let maxOverlap = 0;
++                const candTokens = tokensOf.get(memory);
++                for (const chosen of selected) {
++                    const overlap = jaccard(candTokens, tokensOf.get(chosen));
++                    if (overlap > maxOverlap)
++                        maxOverlap = overlap;
++                }
++                adjusted = memory.scores.final * (1 - diversityFactor * maxOverlap);
++                memory.scores.diversity = maxOverlap;
++            }
++            if (adjusted > bestAdjusted) {
++                bestAdjusted = adjusted;
++                best = memory;
++            }
++        }
++        if (!best)
++            break;
++        // The first memory is always kept; later ones must fit the budget, and
++        // a candidate that does not fit is skipped (a smaller lower-ranked
++        // memory may still fit) instead of ending the selection.
++        const fits = !(selected.length > 0 && tokenBudget > 0 && usedTokens + best.tokens > tokenBudget);
++        if (!fits) {
++            excluded.add(best);
++            continue;
++        }
++        selected.push(best);
++        usedTokens += best.tokens;
++    }
++    if (options.withDebug) {
++        return { selected, scored, timeRef, weights };
++    }
++    return selected;
++}
++// ---------------------------------------------------------------------------
++// Injection gate: skip retrieval for self-contained turns (greetings, bare
++// commands, pure chatter) to save tokens and reduce noise.
++// ---------------------------------------------------------------------------
++const SOCIAL_RE = /^(hi|hello|hey|yo|你好|您好|哈喽|嗨|早上好|早|中午好|下午好|晚上好|晚安|谢谢|多谢|感谢|辛苦了|thanks|thank you|thx|ok|okay|好的|好滴|好的呀|收到|明白|了解|知道了|嗯|嗯嗯|继续|继续吧|继续吧谢谢|go on|continue|再见|拜拜|bye)[!！。.~～\s]*$/i;
++const BARE_COMMAND_RE = /^(git|ls|cd|pwd|cat|head|tail|echo|rg|grep|find|npm|pnpm|yarn|bun|node|python3?|pip3?|docker|kubectl|brew)\b[^\n]{0,80}$/;
++const PUNCT_ONLY_RE = /^[\p{P}\p{S}\s]+$/u;
++export function shouldInjectGate(message) {
++    if (!message || !String(message).trim())
++        return { inject: false, reason: "empty" };
++    const m = String(message).trim();
++    const hasCJK = CJK_RE.test(m);
++    // Slash commands and bare shell lines only count when the turn is purely
++    // that command — a Chinese sentence that merely starts with "/tmp" or
++    // "git 提交一下…" is a normal request and must still get retrieval.
++    if (/^\/[a-z0-9_-]+/i.test(m) && !hasCJK)
++        return { inject: false, reason: "slash-command" };
++    if (SOCIAL_RE.test(m))
++        return { inject: false, reason: "social" };
++    if (!hasCJK && BARE_COMMAND_RE.test(m))
++        return { inject: false, reason: "bare-command" };
++    if (PUNCT_ONLY_RE.test(m))
++        return { inject: false, reason: "punct-only" };
++    return { inject: true, reason: "content" };
++}
+diff -ruN a/dist/services/sqlite/shard-manager.js b/dist/services/sqlite/shard-manager.js
+--- a/dist/services/sqlite/shard-manager.js	2026-09-12 22:13:46
++++ b/dist/services/sqlite/shard-manager.js	2026-09-12 22:13:46
+@@ -159,7 +159,9 @@
+         source TEXT,
+         authority TEXT,
+         observed_at INTEGER,
+-        valid_until INTEGER
++        valid_until INTEGER,
++        inject_count INTEGER DEFAULT 0,
++        last_injected_at INTEGER
+       )
+     `);
+         this.migrateShardDb(db);
+@@ -184,6 +186,8 @@
+                 ["authority", "TEXT"],
+                 ["observed_at", "INTEGER"],
+                 ["valid_until", "INTEGER"],
++                ["inject_count", "INTEGER DEFAULT 0"],
++                ["last_injected_at", "INTEGER"],
+             ];
+             for (const [name, ddl] of additions) {
+                 if (!cols.has(name)) {
+diff -ruN a/dist/services/sqlite/vector-search.d.ts b/dist/services/sqlite/vector-search.d.ts
+--- a/dist/services/sqlite/vector-search.d.ts	2026-09-12 22:13:46
++++ b/dist/services/sqlite/vector-search.d.ts	2026-09-12 22:13:46
+@@ -17,6 +17,7 @@
+     }): any[];
+     getAllMemories(db: DatabaseType): any[];
+     getMemoryById(db: DatabaseType, memoryId: string): any | null;
++    incrementInjectCount(db: DatabaseType, memoryId: string, timestamp?: number): boolean;
+     getMemoriesBySessionID(db: DatabaseType, sessionID: string): any[];
+     countVectors(db: DatabaseType, containerTag: string): number;
+     countAllVectors(db: DatabaseType): number;
+diff -ruN a/dist/services/sqlite/vector-search.js b/dist/services/sqlite/vector-search.js
+--- a/dist/services/sqlite/vector-search.js	2026-09-12 22:13:46
++++ b/dist/services/sqlite/vector-search.js	2026-09-12 22:13:46
+@@ -142,6 +142,8 @@
+                 id: row.id,
+                 memory: row.content,
+                 similarity,
++                contentSim: scores.contentSim,
++                tagsSim: finalTagsSim,
+                 tags: memoryTagsStr ? memoryTagsStr.split(",") : [],
+                 metadata: row.metadata ? JSON.parse(row.metadata) : undefined,
+                 containerTag: row.container_tag,
+@@ -152,6 +154,14 @@
+                 projectName: row.project_name,
+                 gitRepoUrl: row.git_repo_url,
+                 isPinned: row.is_pinned,
++                createdAt: row.created_at,
++                updatedAt: row.updated_at,
++                authority: row.authority ?? null,
++                source: row.source ?? null,
++                isStaged: row.is_staged === 1,
++                validUntil: row.valid_until ?? null,
++                injectCount: row.inject_count ?? 0,
++                lastInjectedAt: row.last_injected_at ?? null,
+             };
+         });
+         hydratedResults.sort((a, b) => b.similarity - a.similarity);
+@@ -217,6 +227,25 @@
+     getMemoryById(db, memoryId) {
+         const stmt = db.prepare(`SELECT * FROM memories WHERE id = ?`);
+         return stmt.get(memoryId);
++    }
++    /**
++     * P2: retrieval-frequency counter used as an importance signal by the
++     * hybrid injection ranker. Best-effort; callers must not depend on it.
++     */
++    incrementInjectCount(db, memoryId, timestamp) {
++        try {
++            const stmt = db.prepare(`
++        UPDATE memories
++        SET inject_count = COALESCE(inject_count, 0) + 1, last_injected_at = ?
++        WHERE id = ?
++      `);
++            stmt.run(timestamp ?? Date.now(), memoryId);
++            return true;
++        }
++        catch (error) {
++            log("incrementInjectCount failed", { memoryId, error: String(error) });
++            return false;
++        }
+     }
+     getMemoriesBySessionID(db, sessionID) {
+         const stmt = db.prepare(`

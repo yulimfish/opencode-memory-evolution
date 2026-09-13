@@ -1,0 +1,9 @@
+# Never publish personal memory data or local Dream output.
+*.db
+*.db-*
+backups/
+dream/*.md
+!dream/TEMPLATE.md
+eval/results/
+eval/.cache/
+*.log

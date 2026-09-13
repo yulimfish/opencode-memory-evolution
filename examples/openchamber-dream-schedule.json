@@ -1,0 +1,8 @@
+{
+  "name": "Nightly Dream memory consolidation",
+  "daily": "03:30",
+  "timezone": "Asia/Shanghai",
+  "agent": "memory-dream",
+  "enabled": true,
+  "notes": "The agent is report-only. Review staging reports before applying any memory changes."
+}

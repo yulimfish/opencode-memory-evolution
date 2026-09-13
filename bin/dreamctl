@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+# dreamctl - Local, read-only interface to the opencode-mem data store for the
+# automated Dream pipeline (P0: report-only, never writes to the memory DB).
+#
+# The ONLY files it writes live inside the dream staging dir:
+#   - .run.lock   (concurrency lock)
+#   - run.log     (one-line run/skip log)
+#
+# Usage:
+#   dreamctl stats
+#   dreamctl prompts --since <iso|epoch> [--limit N] [--project P] [--max-chars N]
+#   dreamctl memories --since <iso|epoch> [--limit N] [--project P]
+#   dreamctl lock acquire [--ttl SECONDS] [--trigger NAME] | release | status
+#   dreamctl log <message>
+#
+# Env overrides (gate defaults):
+#   DREAM_MIN_HOURS=24 DREAM_MIN_SESSIONS=3 DREAM_MIN_MEMORIES=10
+set -euo pipefail
+
+HOME_DIR="${HOME}"
+MEM_DATA="${DREAMCTL_MEM_DATA:-$HOME_DIR/.opencode-mem/data}"
+DREAM_DIR="${DREAMCTL_DREAM_DIR:-$HOME_DIR/.config/opencode/memory/dream}"
+PROMPTS_DB="$MEM_DATA/user-prompts.db"
+PROJECTS_DIR="$MEM_DATA/projects"
+LOCK_FILE="$DREAM_DIR/.run.lock"
+LOG_FILE="$DREAM_DIR/run.log"
+
+MIN_HOURS="${DREAM_MIN_HOURS:-24}"
+MIN_SESSIONS="${DREAM_MIN_SESSIONS:-3}"
+MIN_MEMORIES="${DREAM_MIN_MEMORIES:-10}"
+
+die() { printf 'dreamctl: %s\n' "$*" >&2; exit 1; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+need sqlite3
+need jq
+
+to_epoch_ms() {
+  local s="$1" t
+  case "$s" in ''|0|none|never) printf '0\n'; return ;; esac
+  if [[ "$s" =~ ^[0-9]+$ ]]; then
+    if [ "${#s}" -ge 12 ]; then printf '%s\n' "$s"; else printf '%s\n' "$((s * 1000))"; fi
+    return
+  fi
+  # NOTE: BSD date -j is lenient and fills missing fields with the CURRENT clock,
+  # so match the input shape first instead of trial-parsing formats.
+  if [[ "$s" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    # BSD date fills missing fields (incl. H:M:S) with the CURRENT clock, so pad explicitly.
+    t=$(date -j -f "%Y-%m-%d %H:%M:%S" "$s 00:00:00" +%s 2>/dev/null) || die "cannot parse time: $s"
+  elif [[ "$s" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}[T\ ][0-9]{2}:[0-9]{2}:[0-9]{2} ]]; then
+    t=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${s:0:10}T${s:11:8}" +%s 2>/dev/null) || die "cannot parse time: $s"
+  elif [[ "$s" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}[T\ ][0-9]{2}:[0-9]{2} ]]; then
+    t=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${s:0:10}T${s:11:5}:00" +%s 2>/dev/null) || die "cannot parse time: $s"
+  else
+    die "cannot parse time: $s (use YYYY-MM-DD, ISO datetime, or epoch)"
+  fi
+  printf '%s\n' "$((t * 1000))"
+}
+
+ms_to_iso() { date -r "$(( $1 / 1000 ))" '+%Y-%m-%dT%H:%M:%S%z'; }
+
+# q1 <db> <sql> <label> [default] — single-value read-only query; on failure
+# warn on stderr and print the default (empty unless given) instead of silently
+# degrading a gate signal.
+q1() {
+  local out
+  if ! out=$(sqlite3 -readonly "$1" "$2" 2>&1); then
+    printf 'dreamctl: WARN %s query failed: %s\n' "$3" "$out" >&2
+    printf '%s\n' "${4:-}"
+    return 0
+  fi
+  printf '%s\n' "$out"
+}
+
+find_last_report() {
+  local f best="" 
+  for f in "$DREAM_DIR"/*.md; do
+    [ -e "$f" ] || continue
+    case "$(basename "$f")" in TEMPLATE.md|README.md) continue ;; esac
+    if [ -z "$best" ] || [ "$f" -nt "$best" ]; then best="$f"; fi
+  done
+  printf '%s\n' "$best"
+}
+
+cmd_stats() {
+  mkdir -p "$DREAM_DIR"
+  local now_s now_ms last_file last_mtime since_ms hours_json gate reasons_json
+  now_s=$(date +%s); now_ms=$((now_s * 1000))
+  last_file=$(find_last_report)
+  last_mtime=0
+  if [ -n "$last_file" ]; then last_mtime=$(stat -f %m "$last_file"); fi
+  since_ms=$((last_mtime * 1000))
+
+  local prompts_since=0 sessions_since=0 prompts_24h=0 latest_prompt_local=""
+  if [ -f "$PROMPTS_DB" ]; then
+    prompts_since=$(q1 "$PROMPTS_DB" "SELECT COUNT(*) FROM user_prompts WHERE created_at > $since_ms;" "prompts_since" 0)
+    sessions_since=$(q1 "$PROMPTS_DB" "SELECT COUNT(DISTINCT session_id) FROM user_prompts WHERE created_at > $since_ms;" "sessions_since" 0)
+    prompts_24h=$(q1 "$PROMPTS_DB" "SELECT COUNT(*) FROM user_prompts WHERE created_at > $((now_ms - 86400000));" "prompts_24h" 0)
+    latest_prompt_local=$(q1 "$PROMPTS_DB" "SELECT datetime(MAX(created_at)/1000,'unixepoch','localtime') FROM user_prompts;" "latest_prompt")
+  fi
+
+  local projects_json="[]" mem_total=0 mem_since=0 mem_24h=0 latest_mem_ms=0
+  local f row
+  for f in "$PROJECTS_DIR"/*.db; do
+    [ -e "$f" ] || continue
+    if ! row=$(sqlite3 -readonly -json "$f" "SELECT project_path AS project, COUNT(*) AS n, SUM(CASE WHEN created_at > $since_ms THEN 1 ELSE 0 END) AS n_since, SUM(CASE WHEN created_at > $((now_ms - 86400000)) THEN 1 ELSE 0 END) AS n_24h, MAX(created_at) AS latest_ms FROM memories GROUP BY project_path;" 2>&1); then
+      printf 'dreamctl: WARN memory shard read failed (%s): %s\n' "$f" "$row" >&2
+      row='[]'
+    fi
+    [ -z "$row" ] && row='[]'
+    projects_json=$(jq -cn --argjson a "$projects_json" --argjson b "$row" '$a + $b')
+  done
+  mem_total=$(jq -n --argjson p "$projects_json" '[$p[].n] | add // 0')
+  mem_since=$(jq -n --argjson p "$projects_json" '[$p[].n_since] | add // 0')
+  mem_24h=$(jq -n --argjson p "$projects_json" '[$p[].n_24h] | add // 0')
+  latest_mem_ms=$(jq -n --argjson p "$projects_json" '[$p[].latest_ms] | max // 0')
+
+  local hours="" hours_ok=false
+  if [ "$last_mtime" -gt 0 ]; then
+    hours=$(jq -n --argjson now "$now_ms" --argjson mt "$((last_mtime * 1000))" '(($now - $mt) / 3600000 * 10 | floor) / 10')
+    if [ "$(( now_s - last_mtime ))" -ge "$(( MIN_HOURS * 3600 ))" ]; then hours_ok=true; fi
+  else
+    hours_ok=true
+  fi
+
+  reasons_json="[]"
+  local gate_pass=true
+  if [ "$hours_ok" != true ]; then
+    gate_pass=false
+    reasons_json=$(jq -cn --argjson a "$reasons_json" --arg r "hours_since_last_report=${hours} < min_hours=${MIN_HOURS}" '$a + [$r]')
+  fi
+  if [ "$sessions_since" -lt "$MIN_SESSIONS" ] && [ "$mem_since" -lt "$MIN_MEMORIES" ]; then
+    gate_pass=false
+    reasons_json=$(jq -cn --argjson a "$reasons_json" --arg r "sessions_since_report=${sessions_since} < ${MIN_SESSIONS} AND memories_since_report=${mem_since} < ${MIN_MEMORIES}" '$a + [$r]')
+  fi
+
+  local lock_json='{"locked":false,"owner":null,"age_seconds":null}'
+  if [ -f "$LOCK_FILE" ]; then
+    local lock_mtime age
+    lock_mtime=$(stat -f %m "$LOCK_FILE")
+    age=$(( now_s - lock_mtime ))
+    lock_json=$(jq -cn --argjson age "$age" --arg owner "$(head -c 200 "$LOCK_FILE")" '{locked:true, owner:$owner, age_seconds:$age}')
+  fi
+
+  local agents_md="$HOME_DIR/.config/opencode/AGENTS.md"
+  local agents_bytes=0 agents_lines=0 skills_count=0 report_count=0 data_kb=0
+  [ -f "$agents_md" ] && agents_bytes=$(wc -c < "$agents_md" | tr -d ' ')
+  [ -f "$agents_md" ] && agents_lines=$(wc -l < "$agents_md" | tr -d ' ')
+  skills_count=$(find "$HOME_DIR/.config/opencode/skills" -maxdepth 1 -type d 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
+  report_count=$(find "$DREAM_DIR" -maxdepth 1 -name '*.md' ! -name 'TEMPLATE.md' ! -name 'README.md' 2>/dev/null | wc -l | tr -d ' ')
+  data_kb=$(du -sk "$MEM_DATA" 2>/dev/null | cut -f1 | tr -d ' ')
+
+  jq -n \
+    --arg now "$(ms_to_iso "$now_ms")" --argjson now_ms "$now_ms" \
+    --arg last_report "${last_file:-}" --argjson last_mtime "$last_mtime" \
+    --argjson hours_since "${hours:-null}" \
+    --argjson prompts_since "$prompts_since" --argjson sessions_since "$sessions_since" \
+    --argjson prompts_24h "$prompts_24h" --argjson mem_since "$mem_since" --argjson mem_24h "$mem_24h" \
+    --arg latest_prompt "${latest_prompt_local:-}" --argjson latest_mem_ms "$latest_mem_ms" \
+    --argjson gate_pass "$gate_pass" --argjson reasons "$reasons_json" \
+    --argjson min_hours "$MIN_HOURS" --argjson min_sessions "$MIN_SESSIONS" --argjson min_memories "$MIN_MEMORIES" \
+    --argjson projects "$projects_json" --argjson mem_total "$mem_total" \
+    --argjson lock "$lock_json" \
+    --arg dream_dir "$DREAM_DIR" \
+    --argjson agents_bytes "$agents_bytes" --argjson agents_lines "$agents_lines" \
+    --argjson skills_count "$skills_count" --argjson report_count "$report_count" --argjson data_kb "$data_kb" \
+    '{
+      now: $now,
+      dream_dir: $dream_dir,
+      last_report: (if $last_report == "" then null else {path: $last_report, mtime_epoch: $last_mtime, hours_since: $hours_since} end),
+      latest_prompt_local: (if $latest_prompt == "" then null else $latest_prompt end),
+      latest_memory_ms: (if $latest_mem_ms == 0 then null else $latest_mem_ms end),
+      signals: {
+        sessions_since_report: $sessions_since,
+        prompts_since_report: $prompts_since,
+        memories_since_report: $mem_since,
+        prompts_24h: $prompts_24h,
+        memories_24h: $mem_24h
+      },
+      gate: {
+        pass: $gate_pass,
+        thresholds: {min_hours: $min_hours, min_sessions: $min_sessions, min_memories: $min_memories},
+        reasons: $reasons
+      },
+      bank: {total_memories: $mem_total, projects: $projects},
+      budgets: {
+        agents_md_bytes: $agents_bytes, agents_md_lines: $agents_lines,
+        skills_count: $skills_count, dream_report_count: $report_count,
+        memory_data_kb: $data_kb
+      },
+      lock: $lock
+    }'
+}
+
+cmd_prompts() {
+  local since=0 limit=200 project="" maxchars=2000
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --since) since=$(to_epoch_ms "$2"); shift 2 ;;
+      --limit) limit="$2"; shift 2 ;;
+      --project) project="$2"; shift 2 ;;
+      --max-chars) maxchars="$2"; shift 2 ;;
+      *) die "prompts: unknown arg $1" ;;
+    esac
+  done
+  [[ "$limit" =~ ^[0-9]+$ ]] || die "prompts: --limit must be a non-negative integer"
+  [[ "$maxchars" =~ ^[0-9]+$ ]] || die "prompts: --max-chars must be a non-negative integer"
+  [ -f "$PROMPTS_DB" ] || die "prompts db not found: $PROMPTS_DB"
+  local where="created_at > $since"
+  if [ -n "$project" ]; then
+    case "$project" in *"'"*) die "project path cannot contain single quotes" ;; esac
+    where="$where AND project_path = '$project'"
+  fi
+  sqlite3 -readonly -json "$PROMPTS_DB" "
+    SELECT id, session_id, project_path, provider_id, model_id,
+           created_at AS created_at_ms,
+           datetime(created_at/1000,'unixepoch','localtime') AS created_local,
+           substr(content, 1, $maxchars) AS content
+    FROM user_prompts
+    WHERE $where
+    ORDER BY created_at DESC
+    LIMIT $limit;" || die "prompts query failed"
+}
+
+cmd_memories() {
+  local since=0 limit=200 project=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --since) since=$(to_epoch_ms "$2"); shift 2 ;;
+      --limit) limit="$2"; shift 2 ;;
+      --project) project="$2"; shift 2 ;;
+      *) die "memories: unknown arg $1" ;;
+    esac
+  done
+  [[ "$limit" =~ ^[0-9]+$ ]] || die "memories: --limit must be a non-negative integer"
+  local where="created_at > $since"
+  if [ -n "$project" ]; then
+    case "$project" in *"'"*) die "project path cannot contain single quotes" ;; esac
+    where="$where AND project_path = '$project'"
+  fi
+  local f out="[]" row
+  for f in "$PROJECTS_DIR"/*.db; do
+    [ -e "$f" ] || continue
+    row=$(sqlite3 -readonly -json "$f" "
+      SELECT id, project_path AS project, project_name, type, tags, is_pinned,
+             created_at AS created_at_ms, updated_at AS updated_at_ms,
+             datetime(created_at/1000,'unixepoch','localtime') AS created_local,
+             metadata, content
+      FROM memories
+      WHERE $where
+      ORDER BY created_at DESC;" 2>/dev/null || true)
+    [ -z "$row" ] && row='[]'
+    out=$(jq -cn --argjson a "$out" --argjson b "$row" '$a + $b')
+  done
+  jq -n --argjson all "$out" --argjson limit "$limit" '$all | sort_by(.created_at_ms) | reverse | .[0:$limit]'
+}
+
+cmd_lock() {
+  local action="${1:-status}"; shift || true
+  mkdir -p "$DREAM_DIR"
+  local now_s ttl=7200 trigger="manual"
+  now_s=$(date +%s)
+  case "$action" in
+    acquire)
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --ttl) ttl="$2"; shift 2 ;;
+          --trigger) trigger="$2"; shift 2 ;;
+          *) die "lock acquire: unknown arg $1" ;;
+        esac
+      done
+      if [ -f "$LOCK_FILE" ]; then
+        local age stored_ttl
+        age=$(( now_s - $(stat -f %m "$LOCK_FILE") ))
+        stored_ttl=$(grep -o 'ttl:[0-9]*' "$LOCK_FILE" 2>/dev/null | head -1 | cut -d: -f2 || true)
+        stored_ttl="${stored_ttl:-7200}"
+        if [ "$age" -lt "$stored_ttl" ]; then
+          printf 'LOCKED age=%ss ttl=%ss owner=%s\n' "$age" "$stored_ttl" "$(head -c 200 "$LOCK_FILE")"
+          exit 3
+        fi
+        printf 'WARN: stale lock age=%ss >= ttl=%ss, overriding\n' "$age" "$stored_ttl" >&2
+      fi
+      printf '%s pid:%s %s trigger:%s ttl:%s\n' "$(ms_to_iso "$((now_s * 1000))")" "$$" "$(hostname -s)" "$trigger" "$ttl" > "$LOCK_FILE"
+      printf 'ACQUIRED ttl=%ss trigger=%s\n' "$ttl" "$trigger"
+      ;;
+    release)
+      if [ -f "$LOCK_FILE" ]; then rm -f "$LOCK_FILE"; printf 'RELEASED\n'; else printf 'NO_LOCK\n'; fi
+      ;;
+    status)
+      if [ -f "$LOCK_FILE" ]; then
+        printf '{"locked":true,"age_seconds":%s,"owner":%s}\n' "$(( now_s - $(stat -f %m "$LOCK_FILE") ))" "$(jq -Rn --arg o "$(head -c 200 "$LOCK_FILE")" '$o')"
+      else
+        printf '{"locked":false,"age_seconds":null,"owner":null}\n'
+      fi
+      ;;
+    *) die "lock: unknown action $action (acquire|release|status)" ;;
+  esac
+}
+
+cmd_log() {
+  mkdir -p "$DREAM_DIR"
+  [ $# -ge 1 ] || die "log: message required"
+  printf '%s | %s\n' "$(ms_to_iso "$(( $(date +%s) * 1000 ))")" "$*" >> "$LOG_FILE"
+  printf 'LOGGED %s\n' "$LOG_FILE"
+}
+
+usage() {
+  sed -n '2,20p' "$0" 2>/dev/null || true
+}
+
+case "${1:-}" in
+  stats) shift; cmd_stats "$@" ;;
+  prompts) shift; cmd_prompts "$@" ;;
+  memories) shift; cmd_memories "$@" ;;
+  lock) shift; cmd_lock "$@" ;;
+  log) shift; cmd_log "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) die "unknown command: $1 (stats|prompts|memories|lock|log)" ;;
+esac
