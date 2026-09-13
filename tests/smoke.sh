@@ -9,6 +9,7 @@ trap 'rm -rf "$tmp"' EXIT
 
 acquired="$(DREAMCTL_DREAM_DIR="$tmp/dream" "$ROOT/bin/dreamctl" lock acquire --ttl 60 --trigger smoke)"
 token="${acquired##* token=}"
+printf '%s\n' "$(DREAMCTL_DREAM_DIR="$tmp/dream" "$ROOT/bin/dreamctl" lock status)" | grep -q '"locked":true'
 
 if DREAMCTL_DREAM_DIR="$tmp/dream" "$ROOT/bin/dreamctl" lock acquire --ttl 60 --trigger second >/dev/null 2>&1; then
   printf 'expected active lock to reject a second acquire\n' >&2
