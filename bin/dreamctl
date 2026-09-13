@@ -135,11 +135,11 @@ cmd_stats() {
   fi
 
   local lock_json='{"locked":false,"owner":null,"age_seconds":null}'
-  if [ -f "$LOCK_FILE" ]; then
+  if [ -d "$LOCK_FILE" ]; then
     local lock_mtime age
     lock_mtime=$(stat -f %m "$LOCK_FILE")
     age=$(( now_s - lock_mtime ))
-    lock_json=$(jq -cn --argjson age "$age" --arg owner "$(head -c 200 "$LOCK_FILE")" '{locked:true, owner:$owner, age_seconds:$age}')
+    lock_json=$(jq -cn --argjson age "$age" --arg owner "$(head -c 200 "$LOCK_FILE/owner" 2>/dev/null || true)" '{locked:true, owner:$owner, age_seconds:$age}')
   fi
 
   local agents_md="$HOME_DIR/.config/opencode/AGENTS.md"
