@@ -5,5 +5,5 @@
   "timezone": "Asia/Shanghai",
   "agent": "build",
   "enabled": true,
-  "notes": "Reviews the Dream staging reports produced by the nightly memory-dream agent. Collects every unhandled proposal from ~/.config/opencode/memory/dream/, restates its evidence, blast radius and rollback, then waits for an explicit user reply before applying anything. This is the only place a Dream proposal becomes a real memory/skill/rule change; the nightly agent itself is report-only. Point this task's prompt at the eval suite so merge candidates are re-checked after approval."
+  "notes": "Reviews the Dream staging reports produced by the nightly memory-dream agent. Collects every unhandled proposal from ~/.config/opencode/memory/dream/, restates its evidence, blast radius and rollback, then waits for an explicit user reply before applying anything. This is the only place a Dream proposal becomes a real memory/skill/rule change; the nightly agent itself is report-only. For L2 skill candidates, confirm the landing location (global ~/.config/opencode/skills/ vs project <repo>/.opencode/skills/) and publish intent before creating anything. Point this task's prompt at the eval suite so merge candidates are re-checked after approval."
 }
