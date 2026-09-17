@@ -1,0 +1,82 @@
+--- a/dist/services/client.js
++++ b/dist/services/client.js
+@@ -372,7 +372,11 @@
+     async mergeMemories(ids, content, options = {}) {
+         try {
+             await this.initialize();
+-            if (!Array.isArray(ids) || ids.length === 0) {
++            if (!Array.isArray(ids)) {
++                return { success: false, error: "ids[] is required" };
++            }
++            const uniqueIds = Array.from(new Set(ids));
++            if (uniqueIds.length === 0) {
+                 return { success: false, error: "ids[] is required" };
+             }
+             if (!content || !content.trim()) {
+@@ -382,16 +386,22 @@
+             const found = [];
+             for (const shard of allShards) {
+                 const db = connectionManager.getConnection(shard.dbPath);
+-                for (const id of ids) {
++                for (const id of uniqueIds) {
+                     const row = vectorSearch.getMemoryById(db, id);
+                     if (row) {
+                         found.push({ id, row, shard });
+                     }
+                 }
+             }
+-            if (found.length === 0) {
+-                return { success: false, error: "No memories found for given ids" };
++            if (found.length !== uniqueIds.length) {
++                const foundIds = new Set(found.map((item) => item.id));
++                const missingIds = uniqueIds.filter((id) => !foundIds.has(id));
++                return { success: false, error: `Memories not found: ${missingIds.join(", ")}` };
+             }
++            const anchorShard = found[0].shard;
++            if (found.some((f) => f.shard.dbPath !== anchorShard.dbPath)) {
++                return { success: false, error: "All memories must belong to the same shard" };
++            }
+             const anchor = found[0].row;
+             const tagSet = new Set();
+             for (const f of found) {
+@@ -429,17 +439,31 @@
+             if (options.isStaged) {
+                 return { success: true, id: addResult.id, merged: found.length, invalidated: 0, staged: true };
+             }
+-            const now = Date.now();
+-            let invalidated = 0;
+-            for (const f of found) {
+-                const db = connectionManager.getConnection(f.shard.dbPath);
+-                const res = db
+-                    .prepare(`UPDATE memories SET valid_until = ?, updated_at = ? WHERE id = ? AND COALESCE(valid_until, 0) = 0`)
+-                    .run(now, now, f.id);
+-                if (Number(res.changes) > 0)
++            const db = connectionManager.getConnection(anchorShard.dbPath);
++            const invalidateTransaction = db.transaction(() => {
++                const now = Date.now();
++                let invalidated = 0;
++                for (const f of found) {
++                    const res = db
++                        .prepare(`UPDATE memories SET valid_until = ?, updated_at = ? WHERE id = ? AND COALESCE(valid_until, 0) = 0`)
++                        .run(now, now, f.id);
++                    if (Number(res.changes) !== 1)
++                        throw new Error(`Memory could not be invalidated: ${f.id}`);
+                     invalidated++;
++                }
++                return invalidated;
++            });
++            try {
++                return { success: true, id: addResult.id, merged: found.length, invalidated: invalidateTransaction() };
+             }
+-            return { success: true, id: addResult.id, merged: found.length, invalidated };
++            catch (error) {
++                const rollback = await this.deleteMemory(addResult.id);
++                const detail = error instanceof Error ? error.message : String(error);
++                if (!rollback.success) {
++                    return { success: false, error: `Merge invalidation failed (${detail}); rollback failed: ${rollback.error}` };
++                }
++                return { success: false, error: `Merge invalidation failed: ${detail}` };
++            }
+         }
+         catch (error) {
+             const errorMessage = error instanceof Error ? error.message : String(error);

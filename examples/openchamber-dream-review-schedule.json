@@ -1,0 +1,9 @@
+{
+  "name": "Weekly Dream proposal review (human gate)",
+  "weekly": ["0"],
+  "time": "20:00",
+  "timezone": "Asia/Shanghai",
+  "agent": "build",
+  "enabled": true,
+  "notes": "Reviews the Dream staging reports produced by the nightly memory-dream agent. Collects every unhandled proposal from ~/.config/opencode/memory/dream/, restates its evidence, blast radius and rollback, then waits for an explicit user reply before applying anything. This is the only place a Dream proposal becomes a real memory/skill/rule change; the nightly agent itself is report-only. Point this task's prompt at the eval suite so merge candidates are re-checked after approval."
+}

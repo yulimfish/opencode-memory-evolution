@@ -1,0 +1,24 @@
+diff --git a/dist/services/web-server-worker.js b/dist/services/web-server-worker.js
+--- a/dist/services/web-server-worker.js
++++ b/dist/services/web-server-worker.js
+@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
+ import { join, dirname } from "node:path";
+ import { fileURLToPath } from "node:url";
+ import { corsPreflightResponse, disallowedCorsResponse, isAllowedBrowserOrigin } from "./cors.js";
+-import { handleListTags, handleListMemories, handleAddMemory, handleDeleteMemory, handleBulkDelete, handleUpdateMemory, handleSearch, handleStats, handlePinMemory, handleUnpinMemory, handleRunCleanup, handleRunDeduplication, handleDetectMigration, handleRunMigration, handleDetectTagMigration, handleRunTagMigrationBatch, handleGetTagMigrationProgress, handleDeletePrompt, handleBulkDeletePrompts, handleGetUserProfile, handleGetProfileChangelog, handleGetProfileSnapshot, handleRefreshProfile, handleAICleanup, handleApplyCleanup, handleUpdateProfileItem, } from "./api-handlers.js";
++import { handleListTags, handleListMemories, handleAddMemory, handleDeleteMemory, handleBulkDelete, handleUpdateMemory, handleMergeMemories, handleSearch, handleStats, handlePinMemory, handleUnpinMemory, handleRunCleanup, handleRunDeduplication, handleDetectMigration, handleRunMigration, handleDetectTagMigration, handleRunTagMigrationBatch, handleGetTagMigrationProgress, handleDeletePrompt, handleBulkDeletePrompts, handleGetUserProfile, handleGetProfileChangelog, handleGetProfileSnapshot, handleRefreshProfile, handleAICleanup, handleApplyCleanup, handleUpdateProfileItem, } from "./api-handlers.js";
+ const __filename = fileURLToPath(import.meta.url);
+ const __dirname = dirname(__filename);
+ let server = null;
+@@ -72,6 +72,11 @@ async function handleRequest(req) {
+             const result = await handleBulkDelete(body.ids || [], cascade);
+             return jsonResponse(result);
+         }
++        if (path === "/api/memories/merge" && method === "POST") {
++            const body = (await req.json());
++            const result = await handleMergeMemories(body);
++            return jsonResponse(result);
++        }
+         if (path === "/api/search" && method === "GET") {
+             const query = url.searchParams.get("q");
+             const tag = url.searchParams.get("tag") || undefined;
